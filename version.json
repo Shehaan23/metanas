@@ -1,0 +1,6 @@
+{
+  "version": "13.3.0",
+  "download_url": "https://assortive.gumroad.com/l/plwki",
+  "release_notes": "Script Source filters (media type, detection mode, results limit) + project DB save fix",
+  "required": false
+}
