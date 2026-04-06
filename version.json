@@ -1,6 +1,6 @@
 {
-  "version": "13.3.0",
+  "version": "13.4.0",
   "download_url": "https://assortive.gumroad.com/l/plwki",
-  "release_notes": "Script Source filters (media type, detection mode, results limit) + project DB save fix",
+  "release_notes": "Smart Search — AI-powered query expansion finds related clips using synonyms and context. Script Source filters for media type, detection mode, and results limit.",
   "required": false
 }

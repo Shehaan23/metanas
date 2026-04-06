@@ -86,7 +86,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "1.0.0"
+APP_VERSION = "13.4.0"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -95,7 +95,7 @@ APP_VERSION = "1.0.0"
 #     "download_url": "https://yoursite.com/download",
 #     "release_notes": "What's new in this version",
 #     "required": false }   ← set true to force update (blocks UI)
-UPDATE_MANIFEST_URL = "https://gist.githubusercontent.com/Cryptolankan/fa4141b270d932cc82099baa512d9a5e/raw/c4cf3c3130873c29569b09cf642dd52199190fb9/metanas_version.json"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Shehaan23/metanas/main/version.json"
 
 _update_info: dict = {}   # populated by background thread at startup
 
@@ -479,9 +479,12 @@ def stats():
 
 @app.route("/api/tag", methods=["POST"])
 def start_tag():
-    data      = request.json or {}
-    folder    = data.get("folder", "").strip()
-    reprocess = data.get("reprocess", False)
+    data           = request.json or {}
+    folder         = data.get("folder", "").strip()
+    reprocess      = data.get("reprocess", False)
+    save_to_main   = data.get("save_to_main", True)
+    project_db     = data.get("project_db", "").strip()
+    project_folder = data.get("project_folder", "").strip()
 
     if not folder:
         return jsonify({"error": "No folder specified"}), 400
@@ -506,6 +509,46 @@ def start_tag():
               "--folder", folder]
     if reprocess:
         cmd.append("--reprocess")
+
+    # ── Project-specific database support ─────────────────────────────
+    # Resolve the project DB path so footage_tagger writes to the correct file.
+    # If user chose a custom folder, use that; otherwise default to METANAS_HOME/project_dbs/
+    project_db_path = None
+    if project_db:
+        # Ensure filename ends with .db
+        if not project_db.endswith(".db"):
+            project_db += ".db"
+        # Determine save directory
+        if project_folder:
+            proj_dir = Path(project_folder).expanduser()
+        else:
+            proj_dir = METANAS_HOME / "project_dbs"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        project_db_path = str(proj_dir / project_db)
+
+    # If save_to_main is False and no project DB specified, that's an error
+    # (frontend should prevent this, but guard against it)
+    if not save_to_main and not project_db_path:
+        return jsonify({"error": "No database target — enable main archive or enter a project DB name."}), 400
+
+    # Pass --db-path to footage_tagger when we have a project DB.
+    # If save_to_main is False, the project DB *replaces* the main archive.
+    # If save_to_main is True AND a project DB is set, footage_tagger writes
+    # to the project DB (via --db-path) and we also write to main archive
+    # by not overriding the config db_path — BUT footage_tagger only writes
+    # to one DB at a time, so we handle dual-write by running the tagger
+    # with the project DB path, then copying new rows to main afterwards.
+    if project_db_path:
+        cmd.extend(["--db-path", project_db_path])
+        # Remember custom project DB folders so /api/project-dbs can find them later
+        if project_folder:
+            cfg = load_config()
+            known_folders = cfg.get("project_db_folders", [])
+            abs_folder = str(Path(project_folder).expanduser().resolve())
+            if abs_folder not in known_folders:
+                known_folders.append(abs_folder)
+                cfg["project_db_folders"] = known_folders
+                write_config(cfg)
 
     caffeinate_enabled = load_config().get("caffeinate", False)
 
@@ -626,9 +669,91 @@ def history():
     return jsonify(load_history())
 
 
+# ── Smart Search: AI query expansion ──────────────────────────────────────────
+def _expand_query(user_query: str, config: dict) -> str:
+    """Use Gemini/OpenAI to expand a search query with synonyms and related terms.
+    Returns an FTS5-compatible OR query string.
+    Example: 'old lady smiling' → 'old OR lady OR smiling OR elderly OR woman OR senior OR grandmother OR happy OR joyful'
+    """
+    api_key  = config.get("gemini_api_key", "") or config.get("openai_api_key", "")
+    provider = config.get("vision_provider", "gemini")
+    if not api_key:
+        # No API key — fall back to original query
+        return user_query
+
+    EXPAND_PROMPT = (
+        "You are helping a video editor search their footage library. "
+        "Given this search query, generate a list of synonyms, related terms, "
+        "and alternative phrasings that a footage tagger might have used to describe "
+        "similar content. Think about:\n"
+        "- Synonyms (old lady → elderly woman, senior)\n"
+        "- Related concepts (smiling → happy, joyful, cheerful, laughing)\n"
+        "- Visual descriptions (sunset → golden hour, dusk, warm light)\n"
+        "- Common tagging terms used in video production\n\n"
+        "IMPORTANT: Return ONLY a comma-separated list of individual words and short phrases. "
+        "No explanations, no numbering, no categories. Keep each term to 1-3 words max. "
+        "Include the original query terms too. Aim for 10-20 terms total.\n\n"
+        f"Search query: {user_query}"
+    )
+
+    try:
+        if provider == "gemini":
+            from google import genai as _genai
+            _client = _genai.Client(api_key=api_key)
+            resp = _client.models.generate_content(
+                model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+                contents=EXPAND_PROMPT
+            )
+            raw = resp.text.strip()
+        else:
+            from openai import OpenAI
+            resp = OpenAI(api_key=api_key).chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": EXPAND_PROMPT}],
+                temperature=0.3
+            )
+            raw = resp.choices[0].message.content.strip()
+
+        # Parse comma-separated terms into FTS5 OR query
+        terms = [t.strip().strip('"').strip("'") for t in raw.split(",") if t.strip()]
+        # Also add the original words
+        for word in user_query.split():
+            w = word.strip().lower()
+            if w and w not in [t.lower() for t in terms]:
+                terms.insert(0, w)
+        # Build FTS5 OR query — each term quoted to handle multi-word phrases
+        fts_parts = []
+        for t in terms[:25]:  # cap at 25 terms to avoid huge queries
+            # For multi-word terms, wrap in quotes; single words go as-is
+            cleaned = t.strip()
+            if not cleaned:
+                continue
+            if " " in cleaned:
+                fts_parts.append(f'"{cleaned}"')
+            else:
+                fts_parts.append(cleaned)
+        return " OR ".join(fts_parts) if fts_parts else user_query
+    except Exception:
+        # AI call failed — fall back to original query
+        return user_query
+
+
+@app.route("/api/expand-query", methods=["POST"])
+def expand_query_api():
+    """Endpoint for the frontend to request query expansion."""
+    data  = request.get_json() or {}
+    query = data.get("q", "").strip()
+    if not query:
+        return jsonify({"expanded": "", "original": ""})
+    config   = load_config()
+    expanded = _expand_query(query, config)
+    return jsonify({"expanded": expanded, "original": query})
+
+
 @app.route("/api/search")
 def search_api():
     query           = request.args.get("q", "").strip()
+    smart           = request.args.get("smart", "false") == "true"
     ftype           = request.args.get("type", "")
     person          = request.args.get("person", "")
     camera          = request.args.get("camera", "")
@@ -680,6 +805,11 @@ def search_api():
     SEL  = "file_path,file_type,camera_model,description,shot_type,persons,tags,setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,audio_type,color_palette,mood_tags"
     MSEL = "m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags"
 
+    # ── Smart search: expand query with AI synonyms ─────────────────
+    expanded_query = None
+    if query and smart:
+        expanded_query = _expand_query(query, config)
+
     try:
         conn = sqlite3.connect(db_path)
         if person:
@@ -687,8 +817,9 @@ def search_api():
             sql, params = _filters(sql, params)
             sql += " LIMIT 100"
         elif query:
+            search_q = expanded_query if expanded_query else query
             sql = f"SELECT {MSEL} FROM media_fts f JOIN media_files m ON m.rowid=f.rowid WHERE media_fts MATCH ?"
-            params = [query]
+            params = [search_q]
             sql, params = _filters(sql, params, "m.")
             sql += " LIMIT 50"
         else:
@@ -717,6 +848,9 @@ def search_api():
                 "folder":          Path(r[0]).parent.name,
             })
         conn.close()
+        # Include expansion info so the UI can show what was searched
+        if expanded_query and expanded_query != query:
+            return jsonify({"results": results, "expanded": expanded_query, "original": query})
         return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -875,25 +1009,42 @@ def file_thumbnails():
 
 @app.route("/api/project-dbs")
 def project_dbs():
-    """List all project-specific SQLite databases."""
+    """List all project-specific SQLite databases.
+    Scans the default project_dbs folder AND any custom folder the user
+    has recently used (stored in config as project_db_folders)."""
     config   = load_config()
-    proj_dir = METANAS_HOME / "project_dbs"
-    if not proj_dir.exists():
-        return jsonify([])
+    # Collect all directories to scan
+    scan_dirs = set()
+    default_dir = METANAS_HOME / "project_dbs"
+    if default_dir.exists():
+        scan_dirs.add(default_dir)
+    # Also scan any custom folders previously used
+    for extra in config.get("project_db_folders", []):
+        p = Path(extra).expanduser()
+        if p.exists() and p.is_dir():
+            scan_dirs.add(p)
+
     dbs = []
-    for f in sorted(proj_dir.glob("*.db"), key=lambda x: x.stat().st_mtime, reverse=True):
-        try:
-            conn  = sqlite3.connect(str(f))
-            count = conn.execute("SELECT COUNT(*) FROM media_files").fetchone()[0]
-            conn.close()
-            dbs.append({
-                "name":     f.name,
-                "path":     str(f),
-                "count":    count,
-                "modified": __import__("datetime").datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d"),
-            })
-        except Exception:
-            pass
+    seen_paths = set()
+    for proj_dir in scan_dirs:
+        for f in sorted(proj_dir.glob("*.db"), key=lambda x: x.stat().st_mtime, reverse=True):
+            if str(f) in seen_paths:
+                continue
+            seen_paths.add(str(f))
+            try:
+                conn  = sqlite3.connect(str(f))
+                count = conn.execute("SELECT COUNT(*) FROM media_files").fetchone()[0]
+                conn.close()
+                dbs.append({
+                    "name":     f.name,
+                    "path":     str(f),
+                    "count":    count,
+                    "modified": __import__("datetime").datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d"),
+                })
+            except Exception:
+                pass
+    # Sort all by modification date, newest first
+    dbs.sort(key=lambda d: d["modified"], reverse=True)
     return jsonify(dbs)
 
 
@@ -941,10 +1092,14 @@ def filter_options():
 @app.route("/api/script-source", methods=["POST"])
 def script_source():
     """Parse a VO script with AI, then search DB for each shot."""
-    data        = request.get_json() or {}
-    script_text = data.get("script", "").strip()
-    db_param    = data.get("db", "")
-    max_per     = int(data.get("max_per_shot", 5))
+    data           = request.get_json() or {}
+    script_text    = data.get("script", "").strip()
+    db_param       = data.get("db", "")
+    max_per        = int(data.get("max_per_shot", 5))
+    media_filter   = data.get("media_filter", "all")        # all | video | image
+    detection_mode = data.get("detection_mode", "both")      # both | scene | audio
+    results_limit  = int(data.get("results_limit", 10))      # 5 | 10 | 15
+    smart_search   = data.get("smart_search", True)           # default ON for script source
     if not script_text:
         return jsonify({"error": "No script provided"}), 400
     config  = load_config()
@@ -987,32 +1142,93 @@ def script_source():
 
     SEL = ("m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,"
            "m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,"
-           "m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags")
+           "m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags,"
+           "m.transcription")
     FB  = ("file_path,file_type,camera_model,description,shot_type,"
            "persons,tags,setting,lighting,mood,fps,processed_at,"
-           "camera_movement,time_of_day,audio_type,color_palette,mood_tags")
+           "camera_movement,time_of_day,audio_type,color_palette,mood_tags,"
+           "transcription")
+
+    # ── Build WHERE clause for media type filter ──────────────────
+    media_where = ""
+    media_params = []
+    if media_filter == "video":
+        media_where = " AND m.file_type = ?"
+        media_params = ["video"]
+    elif media_filter == "image":
+        media_where = " AND m.file_type = ?"
+        media_params = ["image"]
+
+    # ── Detection mode affects which columns are searched ─────────
+    # scene  = description, shot_type, setting, tags, mood (visual)
+    # audio  = transcription, audio_type
+    # both   = all of the above (default FTS behaviour)
+    if detection_mode == "scene":
+        fts_fields = "description OR shot_type OR setting OR tags OR mood"
+    elif detection_mode == "audio":
+        fts_fields = "transcription OR audio_type"
+    else:
+        fts_fields = None   # default — match all indexed columns
+
     try:
         conn = sqlite3.connect(db_path)
         results_out = []
         for shot in shots_parsed:
             label = shot.get("label", "")
             query = shot.get("query", "")
+
+            # ── Smart search: expand the AI-generated query with synonyms ──
+            search_query = query
+            if smart_search and query:
+                try:
+                    search_query = _expand_query(query, config)
+                except Exception:
+                    search_query = query
+
+            # ── FTS search ────────────────────────────────────
             try:
+                if detection_mode == "scene":
+                    fts_query = f"(description OR shot_type OR setting OR tags OR mood) : {search_query}"
+                elif detection_mode == "audio":
+                    fts_query = f"(transcription) : {search_query}"
+                else:
+                    fts_query = search_query
+
                 rows = conn.execute(
-                    f"SELECT {SEL} FROM media_fts f JOIN media_files m ON m.rowid=f.rowid WHERE media_fts MATCH ? LIMIT ?",
-                    [query, max_per]
+                    f"SELECT {SEL} FROM media_fts f JOIN media_files m ON m.rowid=f.rowid "
+                    f"WHERE media_fts MATCH ?{media_where} LIMIT ?",
+                    [fts_query] + media_params + [max_per]
                 ).fetchall()
             except Exception:
                 rows = []
+
+            # ── Fallback: LIKE search if FTS returns nothing ──
             if not rows:
                 try:
                     kw = query.split()[0].lower() if query.split() else ""
+                    fb_media = ""
+                    fb_params = []
+                    if media_filter == "video":
+                        fb_media = " AND file_type = ?"
+                        fb_params = ["video"]
+                    elif media_filter == "image":
+                        fb_media = " AND file_type = ?"
+                        fb_params = ["image"]
+
+                    if detection_mode == "scene":
+                        search_col = "LOWER(description||' '||COALESCE(tags,'')||' '||COALESCE(setting,''))"
+                    elif detection_mode == "audio":
+                        search_col = "LOWER(COALESCE(transcription,'')||' '||COALESCE(audio_type,''))"
+                    else:
+                        search_col = "LOWER(description||' '||COALESCE(tags,'')||' '||COALESCE(transcription,''))"
+
                     rows = conn.execute(
-                        f"SELECT {FB} FROM media_files WHERE LOWER(description||\' \'||COALESCE(tags,\'\')) LIKE ? ORDER BY processed_at DESC LIMIT ?",
-                        [f"%{kw}%", max_per]
+                        f"SELECT {FB} FROM media_files WHERE {search_col} LIKE ?{fb_media} ORDER BY processed_at DESC LIMIT ?",
+                        [f"%{kw}%"] + fb_params + [max_per]
                     ).fetchall()
                 except Exception:
                     rows = []
+
             clips = [{"file_path":r[0],"file_type":r[1],"camera_model":r[2] or "Unknown",
                       "description":r[3] or "","shot_type":r[4] or "",
                       "persons":json.loads(r[5] or "[]"),"tags":json.loads(r[6] or "[]"),
@@ -1021,8 +1237,12 @@ def script_source():
                       "camera_movement":r[12] or "","time_of_day":r[13] or "",
                       "audio_type":r[14] or "","color_palette":r[15] or "",
                       "mood_tags":json.loads(r[16] or "[]"),
+                      "transcription":r[17] or "",
                       "filename":Path(r[0]).name,"folder":Path(r[0]).parent.name,
                       "_score":"","_toast":""} for r in rows]
+
+            # ── Apply results_limit to total displayed per shot ──
+            clips = clips[:results_limit]
             results_out.append({"label":label,"query":query,"results":clips,"_open":False})
         conn.close()
         if results_out:
@@ -1880,14 +2100,24 @@ HTML_TEMPLATE = r"""
         <button class="btn btn-ghost btn-sm" @click="loadProjectDbs()" title="Refresh project DB list" style="flex-shrink:0">↻</button>
       </div>
 
-      <div style="display:flex;gap:8px;margin-bottom:16px">
-        <input type="text" x-model="searchQuery" placeholder="golden hour boat, drone aerial, Shenelle close-up…" @keydown.enter="doSearch()" style="flex:1" />
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" x-model="searchQuery" placeholder="golden hour boat, drone aerial, old lady smiling…" @keydown.enter="doSearch()" style="flex:1" />
         <button class="btn btn-primary" @click="doSearch()">Search</button>
       </div>
-      <div class="pill-row">
-        <span class="pill" :class="{active:searchType===''}" @click="searchType='';doSearch()">All</span>
-        <span class="pill" :class="{active:searchType==='video'}" @click="searchType='video';doSearch()">Videos</span>
-        <span class="pill" :class="{active:searchType==='image'}" @click="searchType='image';doSearch()">Images</span>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
+        <div class="pill-row">
+          <span class="pill" :class="{active:searchType===''}" @click="searchType='';doSearch()">All</span>
+          <span class="pill" :class="{active:searchType==='video'}" @click="searchType='video';doSearch()">Videos</span>
+          <span class="pill" :class="{active:searchType==='image'}" @click="searchType='image';doSearch()">Images</span>
+        </div>
+        <div class="pill-row" style="gap:4px;">
+          <span class="pill" :class="{active:!smartSearch}" @click="smartSearch=false;doSearch()" style="font-size:11px;">🔍 Exact</span>
+          <span class="pill" :class="{active:smartSearch}" @click="smartSearch=true;doSearch()" style="font-size:11px;">✦ Smart</span>
+        </div>
+      </div>
+      <!-- Smart search expansion info -->
+      <div x-show="smartSearch && expandedInfo" style="font-size:11px;color:var(--muted);margin-bottom:12px;padding:8px 12px;background:rgba(240,112,32,.06);border:1px solid rgba(240,112,32,.15);border-radius:8px;">
+        ✦ AI expanded your search: <span x-text="expandedInfo" style="color:var(--accent);"></span>
       </div>
 
       <!-- ── Send-to destination ──────────────────────────────── -->
@@ -2001,6 +2231,41 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
                 <option value="8">8</option>
                 <option value="10">10</option>
               </select>
+            </div>
+          </div>
+
+          <!-- ── Filter row ─────────────────────────────────── -->
+          <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:14px;">
+            <div>
+              <label style="margin-bottom:4px;">Media type</label>
+              <div style="display:flex;gap:6px;margin-top:4px;">
+                <span class="pill" :class="{active:scriptMediaFilter==='all'}"   @click="scriptMediaFilter='all'"   style="font-size:11px;">All</span>
+                <span class="pill" :class="{active:scriptMediaFilter==='video'}" @click="scriptMediaFilter='video'" style="font-size:11px;">🎬 Video</span>
+                <span class="pill" :class="{active:scriptMediaFilter==='image'}" @click="scriptMediaFilter='image'" style="font-size:11px;">📷 Image</span>
+              </div>
+            </div>
+            <div>
+              <label style="margin-bottom:4px;">Detection mode</label>
+              <div style="display:flex;gap:6px;margin-top:4px;">
+                <span class="pill" :class="{active:scriptDetectionMode==='both'}"  @click="scriptDetectionMode='both'"  style="font-size:11px;">Scene + Audio</span>
+                <span class="pill" :class="{active:scriptDetectionMode==='scene'}" @click="scriptDetectionMode='scene'" style="font-size:11px;">Scene only</span>
+                <span class="pill" :class="{active:scriptDetectionMode==='audio'}" @click="scriptDetectionMode='audio'" style="font-size:11px;">Audio only</span>
+              </div>
+            </div>
+            <div>
+              <label style="margin-bottom:4px;">Results to show</label>
+              <select x-model="scriptResultsLimit" style="width:80px;">
+                <option value="5">5</option>
+                <option value="10">10</option>
+                <option value="15">15</option>
+              </select>
+            </div>
+            <div>
+              <label style="margin-bottom:4px;">Search mode</label>
+              <div style="display:flex;gap:4px;margin-top:4px;">
+                <span class="pill" :class="{active:!scriptSmartSearch}" @click="scriptSmartSearch=false" style="font-size:11px;">🔍 Exact</span>
+                <span class="pill" :class="{active:scriptSmartSearch}" @click="scriptSmartSearch=true" style="font-size:11px;">✦ Smart</span>
+              </div>
             </div>
           </div>
         </div>
@@ -2410,6 +2675,8 @@ function app() {
 
     // Search
     searchQuery: '',
+    smartSearch: true,
+    expandedInfo: '',
     searchType: '',
     searchResults: [],
     searchLoading: false,
@@ -2438,6 +2705,10 @@ function app() {
     scriptShots: [],
     scriptSearchDb: '',
     scriptMaxPerShot: '5',
+    scriptMediaFilter: 'all',       // all | video | image
+    scriptDetectionMode: 'both',    // both | scene | audio
+    scriptResultsLimit: '10',       // 5 | 10 | 15
+    scriptSmartSearch: true,        // AI query expansion for shot matching
 
     // Settings
     settings: {},
@@ -2517,9 +2788,10 @@ function app() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           folder,
-          reprocess:    this.tagReprocess,
-          save_to_main: this.saveToMain,
-          project_db:   this.projectDbName.trim(),
+          reprocess:      this.tagReprocess,
+          save_to_main:   this.saveToMain,
+          project_db:     this.projectDbName.trim(),
+          project_folder: this.projectDbFolder.trim(),
         })
       });
       const d = await r.json();
@@ -2588,10 +2860,12 @@ function app() {
     async doSearch() {
       this.searchLoading = true;
       this.searchError   = '';
+      this.expandedInfo  = '';
       try {
         const params = new URLSearchParams();
         if (this.searchQuery) params.append('q', this.searchQuery);
         if (this.searchType) params.append('type', this.searchType);
+        if (this.smartSearch && this.searchQuery) params.append('smart', 'true');
         if (this.filters.camera)          params.append('camera',          this.filters.camera);
         if (this.filters.shot_type)        params.append('shot_type',        this.filters.shot_type);
         if (this.filters.camera_movement)  params.append('camera_movement',  this.filters.camera_movement);
@@ -2609,6 +2883,11 @@ function app() {
         const r = await fetch('/api/search?' + params);
         const d = await r.json();
         if (d.error) { this.searchError = d.error; this.searchResults = []; }
+        else if (d.results) {
+          // Smart search returns {results, expanded, original}
+          this.searchResults = d.results;
+          this.expandedInfo  = d.expanded || '';
+        }
         else this.searchResults = d;
       } catch(e) { this.searchError = 'Search failed'; }
       this.searchLoading = false;
@@ -2715,9 +2994,13 @@ function app() {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            script:       this.scriptText,
-            db:           this.scriptSearchDb,
-            max_per_shot: parseInt(this.scriptMaxPerShot)
+            script:         this.scriptText,
+            db:             this.scriptSearchDb,
+            max_per_shot:   parseInt(this.scriptMaxPerShot),
+            media_filter:   this.scriptMediaFilter,
+            detection_mode: this.scriptDetectionMode,
+            results_limit:  parseInt(this.scriptResultsLimit),
+            smart_search:   this.scriptSmartSearch
           })
         });
         const d = await res.json();
