@@ -1,6 +1,1 @@
-{
-  "version": "13.4.0",
-  "download_url": "https://assortive.gumroad.com/l/plwki",
-  "release_notes": "Smart Search — AI-powered query expansion finds related clips using synonyms and context. Script Source filters for media type, detection mode, and results limit.",
-  "required": false
-}
+{"latest":"13.5.0","download_url":"https://assortive.gumroad.com/l/plwki","release_notes":"Smart Search, thumbnail previews, dual DB write, DB path settings fix, Script Source filters."}
