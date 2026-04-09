@@ -1,1 +1,7 @@
-{"latest":"13.5.0","download_url":"https://github.com/Shehaan23/metanas/releases","release_notes":"Smart Search, thumbnail previews, dual DB write, DB path settings fix, Script Source filters."}
+{
+  "version": "13.5.0",
+  "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/app.py",
+  "download_url": "https://github.com/Shehaan23/metanas/releases",
+  "release_notes": "Smart Search, thumbnail previews, dual DB write, DB path settings fix, Script Source filters.",
+  "required": false
+}
