@@ -25,7 +25,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import yaml
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -86,7 +86,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "13.4.0"
+APP_VERSION = "13.5.0"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -118,6 +118,7 @@ def _check_for_updates():
                 "current":        APP_VERSION,
                 "latest":         latest,
                 "download_url":   manifest.get("download_url", ""),
+                "file_url":       manifest.get("file_url", ""),
                 "release_notes":  manifest.get("release_notes", ""),
                 "required":       required,
             }
@@ -333,9 +334,10 @@ def load_config():
         "embed_metadata": True,
         }
 
-    # ── Auto-heal: ensure db_path is in a writable location ──────────────────
+    # ── Auto-heal: ensure db_path points to a writable location ──────────────
     # Catches cases where an old config has db_path inside an app bundle or
     # other protected directory (produces "authorization denied" on sqlite3.connect).
+    # NOTE: we do NOT require the .db file to exist yet — only the parent folder.
     db = cfg.get("db_path", "")
     # TCC-protected folders — macOS blocks app-bundle subprocesses from writing here
     _tcc_roots = [str(Path.home() / d) for d in ("Desktop", "Documents", "Downloads")]
@@ -344,9 +346,13 @@ def load_config():
         or ".app/" in db
         or ".app\\" in db
         or any(db.startswith(r) for r in _tcc_roots)
-        or not Path(db).parent.exists()
-        or not os.access(str(Path(db).parent), os.W_OK)
     )
+    # Only reset if the parent directory doesn't exist or isn't writable
+    # (but allow db_path where the .db file doesn't exist yet — tagger will create it)
+    if not needs_heal and db:
+        parent = Path(db).parent
+        if not parent.exists() or not os.access(str(parent), os.W_OK):
+            needs_heal = True
     if needs_heal:
         cfg["db_path"] = str(METANAS_HOME / "footage_metadata.db")
         try:
@@ -444,6 +450,16 @@ def post_settings():
         if isinstance(v, str) and "•••" in v:
             continue  # keep existing masked key
         config[k] = v
+
+    # ── If db_path was updated, ensure its parent directory exists ──
+    new_db = config.get("db_path", "")
+    if new_db:
+        db_parent = Path(new_db).expanduser().parent
+        try:
+            db_parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass  # read-only volume, etc — tagger will report the error
+
     write_config(config)
     return jsonify({"ok": True})
 
@@ -453,9 +469,12 @@ def stats():
     config = load_config()
     db_path = config.get("db_path", "")
     nas_ok  = Path(config.get("nas_mount_path", "")).exists()
-    if not db_path or not Path(db_path).exists():
+    db_file_exists = db_path and Path(db_path).exists()
+    if not db_path or not db_file_exists:
         return jsonify({"total": 0, "videos": 0, "images": 0,
-                        "cameras": {}, "db_exists": False, "nas_ok": nas_ok})
+                        "cameras": {}, "db_exists": False, "nas_ok": nas_ok,
+                        "db_path_set": bool(db_path),
+                        "db_parent_ok": bool(db_path) and Path(db_path).parent.exists()})
     migrate_db(db_path)
     try:
         conn    = sqlite3.connect(db_path)
@@ -602,6 +621,46 @@ def start_tag():
                 if any(kw in line for kw in ("Finished.", "Estimated cost", "💰")):
                     summary_lines.append(line)
             proc.wait()
+
+            # ── Dual-write: copy project DB rows → main archive ──────────
+            if proc.returncode == 0 and save_to_main and project_db_path:
+                try:
+                    cfg = load_config()
+                    main_db = cfg.get("db_path", str(METANAS_HOME / "footage_metadata.db"))
+                    q.put({"line": "📦 Syncing tagged data to main archive…"})
+                    proj_conn = sqlite3.connect(project_db_path)
+                    proj_conn.row_factory = sqlite3.Row
+                    rows = proj_conn.execute("SELECT * FROM media_files").fetchall()
+                    if rows:
+                        cols = [desc[0] for desc in proj_conn.execute("SELECT * FROM media_files LIMIT 1").description]
+                        # Exclude 'id' so main DB auto-generates its own IDs
+                        data_cols = [c for c in cols if c != "id"]
+                        placeholders = ", ".join("?" for _ in data_cols)
+                        col_list = ", ".join(data_cols)
+                        main_conn = sqlite3.connect(main_db)
+                        # Ensure the main DB has the same table structure
+                        # (init_db is called at startup, but just in case)
+                        copied = 0
+                        for row in rows:
+                            vals = [row[c] for c in data_cols]
+                            try:
+                                # Use INSERT OR REPLACE keyed on file_path (UNIQUE)
+                                main_conn.execute(
+                                    f"INSERT OR REPLACE INTO media_files ({col_list}) VALUES ({placeholders})",
+                                    vals
+                                )
+                                copied += 1
+                            except Exception as row_err:
+                                q.put({"line": f"⚠ Could not sync row: {row_err}"})
+                        main_conn.commit()
+                        main_conn.close()
+                        q.put({"line": f"✓ {copied} file(s) synced to main archive"})
+                    else:
+                        q.put({"line": "ℹ No rows in project DB to sync"})
+                    proj_conn.close()
+                except Exception as sync_err:
+                    q.put({"line": f"⚠ Sync to main archive failed: {sync_err}"})
+
             jobs[job_id]["status"]  = "done" if proc.returncode == 0 else "error"
             jobs[job_id]["ended"]   = time.strftime("%Y-%m-%d %H:%M:%S")
             jobs[job_id]["summary"] = " | ".join(summary_lines)
@@ -941,6 +1000,20 @@ def pick_folder():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/check-path")
+def check_path():
+    """Check whether a file path exists on disk."""
+    path = urllib.parse.unquote(request.args.get("path", ""))
+    if not path:
+        return jsonify({"exists": False, "parent_exists": False})
+    p = Path(path).expanduser()
+    return jsonify({
+        "exists": p.exists(),
+        "parent_exists": p.parent.exists(),
+        "parent_writable": p.parent.exists() and os.access(str(p.parent), os.W_OK),
+    })
+
+
 @app.route("/api/pick-file", methods=["POST"])
 def pick_file():
     """Open a native macOS FILE picker via osascript."""
@@ -986,15 +1059,18 @@ def pick_file():
 def thumbnail():
     """Serve a cached keyframe thumbnail by path."""
     path = request.args.get("path", "")
-    if path and Path(path).exists():
-        return send_file(path, mimetype="image/jpeg")
+    # Decode any URL-encoded characters (e.g. %20 → space)
+    path = urllib.parse.unquote(path)
+    p = Path(path)
+    if path and p.exists() and p.is_file():
+        return send_file(str(p.resolve()), mimetype="image/jpeg")
     return ("", 404)
 
 
 @app.route("/api/file-thumbnails")
 def file_thumbnails():
     """Return a list of cached thumbnail paths for a given media file."""
-    fp         = request.args.get("path", "")
+    fp         = urllib.parse.unquote(request.args.get("path", ""))
     config     = load_config()
     thumb_base = config.get("thumbnails_path", str(METANAS_HOME / "thumbnails"))
     if not fp:
@@ -1316,11 +1392,79 @@ def trigger_update_check():
     return jsonify({"ok": True})
 
 
+@app.route("/api/apply-update", methods=["POST"])
+def apply_update():
+    """Download the latest app.py from GitHub and replace local copies, then restart."""
+    import shutil
+    global _update_info
+
+    if not _update_info.get("available"):
+        return jsonify({"error": "No update available"}), 400
+
+    file_url = _update_info.get("file_url", "")
+    if not file_url:
+        return jsonify({"error": "No file_url in update manifest — update version.json on GitHub"}), 400
+
+    try:
+        # 1. Download new app.py to a temp location
+        tmp_path = METANAS_HOME / "app_update.py.tmp"
+        req = urllib.request.Request(file_url, headers={"User-Agent": f"METANAS/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            new_code = resp.read()
+
+        # Sanity check — must contain APP_VERSION and Flask
+        code_text = new_code.decode("utf-8", errors="replace")
+        if "APP_VERSION" not in code_text or "Flask" not in code_text:
+            return jsonify({"error": "Downloaded file does not look like a valid app.py"}), 400
+
+        with open(tmp_path, "wb") as f:
+            f.write(new_code)
+
+        # 2. Find all app.py locations in the bundle and replace them
+        bundle_root = BASE_DIR  # Contents/Resources/footage-tagger/
+        targets = [
+            bundle_root / "app.py",                       # footage-tagger/app.py
+            bundle_root.parent / "app.py",                # Resources/app.py
+        ]
+        replaced = []
+        for target in targets:
+            if target.exists():
+                shutil.copy2(str(tmp_path), str(target))
+                replaced.append(str(target))
+
+        # 3. Clear __pycache__ in all relevant directories
+        for d in [bundle_root, bundle_root.parent]:
+            cache_dir = d / "__pycache__"
+            if cache_dir.exists():
+                shutil.rmtree(str(cache_dir), ignore_errors=True)
+
+        # 4. Clean up temp file
+        tmp_path.unlink(missing_ok=True)
+
+        # 5. Schedule a restart — kill the Flask process after a short delay
+        #    so the response can be sent back to the client first
+        def _restart():
+            import signal
+            time.sleep(2)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_restart, daemon=True).start()
+
+        return jsonify({
+            "ok": True,
+            "replaced": replaced,
+            "message": f"Updated to {_update_info.get('latest', '?')}. METANAS is restarting…"
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Update failed: {e}"}), 500
+
+
 # ── Before-request license gate ────────────────────────────────────────────────
 
 UNLOCKED_ENDPOINTS = {
     "activate_page", "activate_license", "license_status", "deactivate_license",
-    "update_status", "trigger_update_check", "static"
+    "update_status", "trigger_update_check", "apply_update", "static"
 }
 
 @app.before_request
@@ -1700,11 +1844,20 @@ HTML_TEMPLATE = r"""
     METANAS <span x-text="info.latest"></span> is ready —
     <span x-show="info.release_notes" x-text="info.release_notes" style="color:#aaa"></span>
   </span>
-  <a :href="info.download_url" target="_blank"
-     style="margin-left:auto; background:#ff8c00; color:#0f0f0f; padding:6px 14px;
-            border-radius:6px; font-weight:700; text-decoration:none; white-space:nowrap; flex-shrink:0;">
-    Download <span x-text="info.latest"></span> →
-  </a>
+  <button @click="
+      $el.textContent = 'Updating…'; $el.disabled = true;
+      fetch('/api/apply-update', {method:'POST'})
+        .then(r => r.json().then(d => ({ok:r.ok, data:d})))
+        .then(({ok, data}) => {
+          if (ok) { $el.textContent = 'Restarting…'; setTimeout(() => location.reload(), 4000); }
+          else { $el.textContent = data.error || 'Failed'; $el.disabled = false; }
+        })
+        .catch(() => { $el.textContent = 'Network error'; $el.disabled = false; })
+    "
+    style="margin-left:auto; background:#ff8c00; color:#0f0f0f; padding:6px 14px;
+           border-radius:6px; font-weight:700; border:none; cursor:pointer; white-space:nowrap; flex-shrink:0; font-family:inherit; font-size:inherit;">
+    Install <span x-text="info.latest"></span>
+  </button>
   <button x-show="!info.required" @click="info.available=false"
           style="background:none;border:none;color:#888;cursor:pointer;font-size:18px;line-height:1;flex-shrink:0">✕</button>
 </div>
@@ -1820,12 +1973,12 @@ HTML_TEMPLATE = r"""
             <label>Folder Path</label>
             <div style="display:flex; gap:8px; align-items:center;">
               <input type="text" x-model="tagFolder" placeholder="/Volumes/Assort2025/Sheneller Projects/2026/MyProject" @keydown.enter="startTag()" @input="onFolderChange()" />
-              <button @click="pickFolder('tagFolder', settings.nas_mount_path); onFolderChange()" class="btn btn-ghost btn-sm" style="flex-shrink:0; white-space:nowrap;">📁 Browse</button>
+              <button @click="pickFolder('tagFolder', settings.nas_mount_path)" class="btn btn-ghost btn-sm" style="flex-shrink:0; white-space:nowrap;">📁 Browse</button>
             </div>
             <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px" x-show="folderHistory.length">
               <span style="font-size:11px;color:var(--muted);align-self:center">Recent:</span>
               <template x-for="f in folderHistory.slice(0,4)" :key="f">
-                <span class="pill" @click="tagFolder=f" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" x-text="f.split('/').slice(-2).join('/')"></span>
+                <span class="pill" @click="tagFolder=f; onFolderChange()" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" x-text="f.split('/').slice(-2).join('/')"></span>
               </template>
             </div>
           </div>
@@ -2477,11 +2630,17 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
         </div>
         <div class="form-row">
           <label>Database Path</label>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <input type="text" x-model="settings.db_path" placeholder="/Users/You/footage_metadata.db" />
-            <button @click="pickFile('settings.db_path', '~', ['db'])" class="btn btn-ghost btn-sm" style="flex-shrink:0; white-space:nowrap;">🗄 Select File</button>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <input type="text" x-model="settings.db_path" placeholder="/Users/You/footage_metadata.db" style="flex:1;min-width:200px;" />
+            <button @click="pickFile('settings.db_path', '~', ['db'])" class="btn btn-ghost btn-sm" style="flex-shrink:0; white-space:nowrap;">🗄 Select Existing DB</button>
+            <button @click="pickDbFolder()" class="btn btn-ghost btn-sm" style="flex-shrink:0; white-space:nowrap;">📁 Choose Folder</button>
           </div>
-          <div style="font-size:11px;color:var(--muted);margin-top:4px">Select an existing <code>.db</code> file, or type a new path and the tagger will create it.</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">
+            <b>Select Existing DB</b> to point to a .db file you already have, or <b>Choose Folder</b> to pick where a new <code>footage_metadata.db</code> will be created on first tag run.
+          </div>
+          <div x-show="settings.db_path && !dbFileExists" style="font-size:11px;color:var(--warn);margin-top:4px">
+            ⚠ Database file does not exist yet — it will be created automatically when you first tag footage.
+          </div>
         </div>
         <div class="form-row">
           <label>Send to Folder</label>
@@ -2637,9 +2796,30 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
             </div>
             <div x-show="updateInfo && updateInfo.available" style="margin-top:10px">
               <div style="font-size:12px;color:var(--muted);margin-bottom:8px" x-text="updateInfo && updateInfo.release_notes"></div>
-              <a :href="updateInfo && updateInfo.download_url" target="_blank" class="btn btn-primary btn-sm" style="display:inline-block;text-decoration:none">
-                Download v<span x-text="updateInfo && updateInfo.latest"></span> →
-              </a>
+              <div x-data="{updating: false, updateMsg: '', updateErr: ''}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <button class="btn btn-primary btn-sm"
+                  :disabled="updating"
+                  @click="
+                    updating = true; updateMsg = ''; updateErr = '';
+                    fetch('/api/apply-update', {method:'POST'})
+                      .then(r => r.json().then(d => ({ok: r.ok, data: d})))
+                      .then(({ok, data}) => {
+                        if (ok) {
+                          updateMsg = data.message || 'Update applied! Restarting…';
+                          setTimeout(() => { location.reload(); }, 4000);
+                        } else {
+                          updateErr = data.error || 'Update failed';
+                          updating = false;
+                        }
+                      })
+                      .catch(e => { updateErr = 'Network error: ' + e; updating = false; })
+                  ">
+                  <span x-show="!updating">Install v<span x-text="updateInfo && updateInfo.latest"></span></span>
+                  <span x-show="updating">Updating…</span>
+                </button>
+                <span x-show="updateMsg" style="font-size:12px;color:var(--success)" x-text="updateMsg"></span>
+                <span x-show="updateErr" style="font-size:12px;color:var(--error)" x-text="updateErr"></span>
+              </div>
             </div>
             <button class="btn btn-ghost btn-sm" style="margin-top:10px"
               @click="checking=true; fetch('/api/check-updates',{method:'POST'}).then(()=>setTimeout(()=>{ fetch('/api/update-status').then(r=>r.json()).then(d=>{updateInfo=d;checking=false}) },5000))">
@@ -2687,6 +2867,9 @@ function app() {
     filters: {camera: '', shot_type: '', camera_movement: '', time_of_day: '', audio_type: '', color_palette: '', setting: '', mood: '', lighting: '', file_ext: '', file_type: '', fps: '', has_people: ''},
     showFilters: false,
 
+    // Database state
+    dbFileExists: true,
+
     // Project DB support
     projectDbName: '',
     projectDbFolder: 'footage-tagger/project_dbs/',
@@ -2720,6 +2903,7 @@ function app() {
       this.tagProvider = this.settings.vision_provider || 'gemini';
       await this.loadStats();
       await this.loadProjectDbs();
+      this.checkDbExists();
     },
 
 
@@ -2764,6 +2948,8 @@ function app() {
         const parts = folder.replace(/\/$/, '').split('/');
         const name  = parts[parts.length - 1] || 'project';
         this.projectDbName = name + '.db';
+        // Auto-set project DB save location to same folder
+        this.projectDbFolder = folder;
       }
     },
 
@@ -2938,6 +3124,10 @@ function app() {
           const data = await res.json();
           if (!data.path) return;
           this._setByPath(targetModel, data.path);
+          // Auto-update project DB fields when the tag folder changes
+          if (targetModel === 'tagFolder') {
+            this.onFolderChange();
+          }
         }
       } catch(e) {
         console.error('Folder picker error:', e);
@@ -2960,6 +3150,37 @@ function app() {
       } catch(e) {
         console.error('File picker error:', e);
       }
+    },
+
+    async pickDbFolder() {
+      try {
+        const res = await fetch('/api/pick-folder', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({start_path: this.settings.db_path ? this.settings.db_path.replace(/[^/]+$/, '') : '~'})
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (!data.path) return;
+          // Append default filename to the chosen folder
+          let folder = data.path.replace(/\/$/, '');
+          this.settings.db_path = folder + '/footage_metadata.db';
+          this.checkDbExists();
+        }
+      } catch(e) {
+        console.error('DB folder picker error:', e);
+      }
+    },
+
+    async checkDbExists() {
+      if (!this.settings.db_path) { this.dbFileExists = false; return; }
+      try {
+        const res = await fetch('/api/check-path?path=' + encodeURIComponent(this.settings.db_path));
+        if (res.ok) {
+          const data = await res.json();
+          this.dbFileExists = data.exists;
+        }
+      } catch(e) { this.dbFileExists = false; }
     },
 
     async loadFilterOptions() {
