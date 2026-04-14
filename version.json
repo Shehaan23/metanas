@@ -1,7 +1,7 @@
 {
-  "version": "13.5.0",
+  "version": "13.6.0",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases",
-  "release_notes": "Smart Search, thumbnail previews, dual DB write, DB path settings fix, Script Source filters.",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v13.6.0",
+  "release_notes": "History redesign\n\n• Replaced log-dump history with clear run summaries\n• At-a-glance stat pills: files tagged, skipped, errors, Gemini cost\n• Smart error grouping — 100s of duplicate errors collapse into counted rows\n• View Full Log modal with live search, copy, and download\n• Windows parity: .arw thumbnails now appear in the Search view\n• Minor Windows build + cross-platform polish",
   "required": false
 }

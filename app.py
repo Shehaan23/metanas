@@ -10,6 +10,7 @@ Usage:
 
 import json
 import os
+import platform
 import queue
 import sqlite3
 import subprocess
@@ -26,6 +27,10 @@ from pathlib import Path
 
 import yaml
 from flask import Flask, Response, jsonify, request, send_file
+
+# ── Cross-platform detection ────────────────────────────────────────────────
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC     = platform.system() == "Darwin"
 
 app = Flask(__name__)
 
@@ -86,7 +91,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "13.5.0"
+APP_VERSION = "13.6.0"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -161,17 +166,30 @@ def get_machine_id() -> str:
         except Exception:
             pass
 
-    # Try ioreg (macOS hardware UUID — most stable)
+    # Get hardware UUID — platform-specific
     mid = ""
     try:
-        result = subprocess.run(
-            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
-            capture_output=True, text=True, timeout=15
-        )
-        for line in result.stdout.splitlines():
-            if "IOPlatformUUID" in line:
-                mid = line.split('"')[-2]
-                break
+        if IS_WINDOWS:
+            # Windows: use wmic to get the machine UUID
+            result = subprocess.run(
+                ["wmic", "csproduct", "get", "UUID"],
+                capture_output=True, text=True, timeout=15
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line and line != "UUID":
+                    mid = line
+                    break
+        else:
+            # macOS: ioreg hardware UUID
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, timeout=15
+            )
+            for line in result.stdout.splitlines():
+                if "IOPlatformUUID" in line:
+                    mid = line.split('"')[-2]
+                    break
     except Exception:
         pass
 
@@ -340,7 +358,10 @@ def load_config():
     # NOTE: we do NOT require the .db file to exist yet — only the parent folder.
     db = cfg.get("db_path", "")
     # TCC-protected folders — macOS blocks app-bundle subprocesses from writing here
-    _tcc_roots = [str(Path.home() / d) for d in ("Desktop", "Documents", "Downloads")]
+    if IS_MAC:
+        _tcc_roots = [str(Path.home() / d) for d in ("Desktop", "Documents", "Downloads")]
+    else:
+        _tcc_roots = []  # Windows doesn't have TCC restrictions
     needs_heal = (
         not db
         or ".app/" in db
@@ -395,6 +416,111 @@ def append_history(entry):
     history.insert(0, entry)
     with open(HISTORY_PATH, "w") as f:
         json.dump(history[:200], f, indent=2)
+    # Prune old log files so we only keep logs for entries still in history
+    _prune_old_logs(history[:200])
+
+
+# ── Job log storage ───────────────────────────────────────────────────────────
+LOGS_DIR = METANAS_HOME / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _log_path(job_id: str) -> Path:
+    """Return the path for a job's full log file."""
+    # Sanitize job_id — only allow alphanumerics and dashes
+    safe = "".join(c for c in str(job_id) if c.isalnum() or c == "-")
+    return LOGS_DIR / f"{safe}.log"
+
+
+def _prune_old_logs(history: list):
+    """Remove log files that no longer have a history entry."""
+    try:
+        valid_ids = {h.get("job_id", "") for h in history if h.get("job_id")}
+        for f in LOGS_DIR.glob("*.log"):
+            if f.stem not in valid_ids:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _parse_job_stats(log_text: str) -> dict:
+    """Parse the tagger output for structured stats.
+    Returns: { tagged, skipped, errors[], cost_usd, api_calls, input_tokens, output_tokens }
+    """
+    import re as _re
+    stats = {
+        "tagged": 0,
+        "skipped": 0,
+        "errors": [],
+        "cost_usd": 0.0,
+        "api_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    # Finished line: "✓ Finished. 8 new file(s) tagged, 2 skipped (already done)"
+    m = _re.search(r"(\d+)\s+new\s+file\(?s?\)?\s+tagged", log_text)
+    if m:
+        stats["tagged"] = int(m.group(1))
+    m = _re.search(r"(\d+)\s+skipped", log_text)
+    if m:
+        stats["skipped"] = int(m.group(1))
+    # Cost summary block
+    m = _re.search(r"Estimated cost\s*:\s*\$?([\d.]+)", log_text)
+    if m:
+        try:
+            stats["cost_usd"] = float(m.group(1))
+        except ValueError:
+            pass
+    m = _re.search(r"Total API calls\s*:\s*(\d+)", log_text)
+    if m:
+        stats["api_calls"] = int(m.group(1))
+    m = _re.search(r"Input tokens\s*:\s*([\d,]+)", log_text)
+    if m:
+        stats["input_tokens"] = int(m.group(1).replace(",", ""))
+    m = _re.search(r"Output tokens\s*:\s*([\d,]+)", log_text)
+    if m:
+        stats["output_tokens"] = int(m.group(1).replace(",", ""))
+    # Errors — every line starting with ERROR: or containing ⚠ (except internal diagnostics)
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # ERROR: … lines
+        err_match = _re.match(r"^\s*ERROR:\s*(.+)$", stripped)
+        if err_match:
+            stats["errors"].append(err_match.group(1).strip())
+            continue
+        # Warning lines with ⚠ — only include those that represent a failure
+        # (skip "⚠ caffeinate not found" and similar housekeeping warnings)
+        if "⚠" in stripped:
+            # Strip leading "⚠" and whitespace
+            msg = stripped.lstrip("⚠ ").strip()
+            # Ignore benign warnings
+            if any(k in msg.lower() for k in (
+                "caffeinate not found",
+                "could not prevent sleep",
+                "sync to main archive failed",  # still logged, but as its own category
+            )):
+                # Skip caffeinate messages entirely; keep sync errors as real errors
+                if "caffeinate" in msg.lower() or "prevent sleep" in msg.lower():
+                    continue
+            # Only include warnings that look like a file failure
+            if any(k in msg.lower() for k in (
+                "could not",
+                "failed",
+                "timed out",
+                "skipping",
+                "aborting",
+                "not found",
+                "rate limit",
+                "unauthorized",
+                "denied",
+            )):
+                stats["errors"].append(msg)
+    return stats
 
 
 def migrate_db(db_path: str):
@@ -522,7 +648,10 @@ def start_tag():
     script = BASE_DIR / "footage_tagger.py"
     # Use the venv Python explicitly — sys.executable can resolve incorrectly
     # when Flask is launched from a macOS app bundle context.
-    VENV_PYTHON = METANAS_HOME / ".venv" / "bin" / "python3"
+    if IS_WINDOWS:
+        VENV_PYTHON = METANAS_HOME / ".venv" / "Scripts" / "python.exe"
+    else:
+        VENV_PYTHON = METANAS_HOME / ".venv" / "bin" / "python3"
     _python = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
     cmd    = [_python, str(script), "--config", str(CONFIG_PATH),
               "--folder", folder]
@@ -573,41 +702,67 @@ def start_tag():
 
     def run():
         caff_proc = None
+        _sleep_prevented = False
         try:
-            # ── Start caffeinate if enabled ──────────────────────────────────
+            # ── Start sleep prevention if enabled ────────────────────────────
             if caffeinate_enabled:
-                try:
-                    caff_proc = subprocess.Popen(["caffeinate", "-i"])
-                    q.put({"line": "☕ Caffeinate active — Mac will not sleep during tagging"})
-                except FileNotFoundError:
-                    q.put({"line": "⚠ caffeinate not found (non-Mac?), continuing without it"})
+                if IS_WINDOWS:
+                    try:
+                        import ctypes
+                        ES_CONTINUOUS       = 0x80000000
+                        ES_SYSTEM_REQUIRED  = 0x00000001
+                        ctypes.windll.kernel32.SetThreadExecutionState(
+                            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                        )
+                        _sleep_prevented = True
+                        q.put({"line": "☕ Sleep prevention active — PC will not sleep during tagging"})
+                    except Exception:
+                        q.put({"line": "⚠ Could not prevent sleep, continuing anyway"})
+                else:
+                    try:
+                        caff_proc = subprocess.Popen(["caffeinate", "-i"])
+                        q.put({"line": "☕ Caffeinate active — Mac will not sleep during tagging"})
+                    except FileNotFoundError:
+                        q.put({"line": "⚠ caffeinate not found, continuing without it"})
 
             # Build a clean environment for the subprocess.
-            # When launched from a macOS app bundle, os.environ can contain
-            # PYTHONHOME / PYTHONPATH pointing at the system Python, which
-            # breaks venv imports (google-genai, sqlite3, etc.).
-            # We use the venv Python explicitly and give it only the vars it needs.
-            import pwd as _pwd
-            _pw = _pwd.getpwuid(os.getuid())
-            _venv_bin = str(METANAS_HOME / ".venv" / "bin")
-            # Include both Homebrew locations (Apple Silicon = /opt/homebrew,
-            # Intel = /usr/local) so ffmpeg, ffprobe, exiftool are always found.
-            _base_path = (
-                "/opt/homebrew/bin:/opt/homebrew/sbin"
-                ":/usr/local/bin:/usr/local/sbin"
-                ":/usr/bin:/bin:/usr/sbin:/sbin"
-            )
-            _subprocess_env = {
-                "HOME":            _pw.pw_dir,
-                "USER":            _pw.pw_name,
-                "LOGNAME":         _pw.pw_name,
-                "PATH":            _venv_bin + ":" + _base_path,
-                "TMPDIR":          os.environ.get("TMPDIR", "/tmp"),
-                "LANG":            os.environ.get("LANG", "en_US.UTF-8"),
-                "PYTHONUNBUFFERED": "1",
-                # Deliberately omit PYTHONHOME / PYTHONPATH so the venv
-                # manages its own sys.path without interference.
-            }
+            if IS_WINDOWS:
+                _venv_bin = str(METANAS_HOME / ".venv" / "Scripts")
+                # On Windows, inherit the current env and prepend venv + tools
+                _subprocess_env = os.environ.copy()
+                # Prepend venv Scripts and bundled tools directory
+                _tools_dir = str(BASE_DIR / "tools")
+                _subprocess_env["PATH"] = _venv_bin + ";" + _tools_dir + ";" + _subprocess_env.get("PATH", "")
+                _subprocess_env["PYTHONUNBUFFERED"] = "1"
+                # Remove PYTHONHOME/PYTHONPATH if set (interferes with venv)
+                _subprocess_env.pop("PYTHONHOME", None)
+                _subprocess_env.pop("PYTHONPATH", None)
+            else:
+                # macOS: build a clean environment from scratch.
+                # When launched from a macOS app bundle, os.environ can contain
+                # PYTHONHOME / PYTHONPATH pointing at the system Python, which
+                # breaks venv imports (google-genai, sqlite3, etc.).
+                import pwd as _pwd
+                _pw = _pwd.getpwuid(os.getuid())
+                _venv_bin = str(METANAS_HOME / ".venv" / "bin")
+                # Include both Homebrew locations (Apple Silicon = /opt/homebrew,
+                # Intel = /usr/local) so ffmpeg, ffprobe, exiftool are always found.
+                _base_path = (
+                    "/opt/homebrew/bin:/opt/homebrew/sbin"
+                    ":/usr/local/bin:/usr/local/sbin"
+                    ":/usr/bin:/bin:/usr/sbin:/sbin"
+                )
+                _subprocess_env = {
+                    "HOME":            _pw.pw_dir,
+                    "USER":            _pw.pw_name,
+                    "LOGNAME":         _pw.pw_name,
+                    "PATH":            _venv_bin + ":" + _base_path,
+                    "TMPDIR":          os.environ.get("TMPDIR", "/tmp"),
+                    "LANG":            os.environ.get("LANG", "en_US.UTF-8"),
+                    "PYTHONUNBUFFERED": "1",
+                    # Deliberately omit PYTHONHOME / PYTHONPATH so the venv
+                    # manages its own sys.path without interference.
+                }
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
@@ -615,12 +770,39 @@ def start_tag():
             )
             jobs[job_id]["process"] = proc
             summary_lines = []
+            # Capture the full log to disk so the UI can retrieve it later.
+            log_file_path = _log_path(job_id)
+            try:
+                log_file = open(log_file_path, "w", encoding="utf-8")
+            except Exception:
+                log_file = None
+            if log_file:
+                log_file.write(f"METANAS job {job_id}\n")
+                log_file.write(f"Folder:   {folder}\n")
+                log_file.write(f"Started:  {jobs[job_id]['started']}\n")
+                log_file.write(f"Reprocess: {reprocess}\n")
+                log_file.write("─" * 60 + "\n\n")
+                log_file.flush()
             for line in proc.stdout:
                 line = line.rstrip()
                 q.put({"line": line})
+                if log_file:
+                    try:
+                        log_file.write(line + "\n")
+                        log_file.flush()
+                    except Exception:
+                        pass
                 if any(kw in line for kw in ("Finished.", "Estimated cost", "💰")):
                     summary_lines.append(line)
             proc.wait()
+            if log_file:
+                try:
+                    log_file.write("\n" + "─" * 60 + "\n")
+                    log_file.write(f"Ended:   {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    log_file.write(f"Exit code: {proc.returncode}\n")
+                    log_file.close()
+                except Exception:
+                    pass
 
             # ── Dual-write: copy project DB rows → main archive ──────────
             if proc.returncode == 0 and save_to_main and project_db_path:
@@ -664,6 +846,19 @@ def start_tag():
             jobs[job_id]["status"]  = "done" if proc.returncode == 0 else "error"
             jobs[job_id]["ended"]   = time.strftime("%Y-%m-%d %H:%M:%S")
             jobs[job_id]["summary"] = " | ".join(summary_lines)
+
+            # ── Parse structured stats from the captured log ──
+            parsed_errors = []
+            parsed_stats  = {}
+            try:
+                if log_file_path.exists():
+                    full_log = log_file_path.read_text(encoding="utf-8", errors="replace")
+                    parsed   = _parse_job_stats(full_log)
+                    parsed_errors = parsed.pop("errors", [])
+                    parsed_stats  = parsed
+            except Exception:
+                pass
+
             append_history({
                 "job_id":    job_id,
                 "folder":    folder,
@@ -672,13 +867,23 @@ def start_tag():
                 "status":    jobs[job_id]["status"],
                 "summary":   jobs[job_id]["summary"],
                 "reprocess": reprocess,
+                "stats":     parsed_stats,
+                "errors":    parsed_errors,
+                "has_log":   log_file_path.exists(),
             })
         except Exception as e:
             q.put({"line": f"ERROR: {e}"})
             jobs[job_id]["status"] = "error"
         finally:
-            # ── Stop caffeinate when job ends ─────────────────────────────────
-            if caff_proc and caff_proc.poll() is None:
+            # ── Stop sleep prevention when job ends ──────────────────────────
+            if IS_WINDOWS and _sleep_prevented:
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS only
+                    q.put({"line": "☕ Sleep prevention released — PC can sleep again"})
+                except Exception:
+                    pass
+            elif caff_proc and caff_proc.poll() is None:
                 caff_proc.terminate()
                 q.put({"line": "☕ Caffeinate released — Mac can sleep again"})
             q.put(None)
@@ -726,6 +931,21 @@ def stop_job(job_id):
 @app.route("/api/history")
 def history():
     return jsonify(load_history())
+
+
+@app.route("/api/job-log/<job_id>")
+def job_log(job_id):
+    """Return the full captured log for a finished job."""
+    p = _log_path(job_id)
+    if not p.exists():
+        return jsonify({"error": "Log not found"}), 404
+    try:
+        return Response(
+            p.read_text(encoding="utf-8", errors="replace"),
+            mimetype="text/plain; charset=utf-8"
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Smart Search: AI query expansion ──────────────────────────────────────────
@@ -919,11 +1139,15 @@ def search_api():
 
 @app.route("/api/reveal", methods=["POST"])
 def reveal_in_finder():
-    """Select the file in Finder without opening it."""
+    """Select the file in Finder (macOS) or Explorer (Windows)."""
     fp = (request.json or {}).get("file_path", "")
     if not fp or not Path(fp).exists():
         return jsonify({"error": "File not found"}), 404
-    subprocess.Popen(["open", "-R", fp])
+    if IS_WINDOWS:
+        # Windows: open Explorer with the file selected
+        subprocess.Popen(["explorer", "/select,", fp.replace("/", "\\")])
+    else:
+        subprocess.Popen(["open", "-R", fp])
     return jsonify({"ok": True})
 
 
@@ -933,10 +1157,33 @@ def open_in_premiere():
     fp = (request.json or {}).get("file_path", "")
     if not fp or not Path(fp).exists():
         return jsonify({"error": "File not found"}), 404
-    result = subprocess.run(
-        ["open", "-a", "Adobe Premiere Pro", fp],
-        capture_output=True, text=True
-    )
+    if IS_WINDOWS:
+        # Try common Premiere Pro install locations on Windows
+        premiere_paths = [
+            r"C:\Program Files\Adobe\Adobe Premiere Pro 2025\Adobe Premiere Pro.exe",
+            r"C:\Program Files\Adobe\Adobe Premiere Pro 2024\Adobe Premiere Pro.exe",
+            r"C:\Program Files\Adobe\Adobe Premiere Pro 2023\Adobe Premiere Pro.exe",
+            r"C:\Program Files\Adobe\Adobe Premiere Pro CC 2022\Adobe Premiere Pro.exe",
+        ]
+        premiere_exe = None
+        for p in premiere_paths:
+            if Path(p).exists():
+                premiere_exe = p
+                break
+        if premiere_exe:
+            result = subprocess.run([premiere_exe, fp], capture_output=True, text=True)
+        else:
+            # Fallback: use os.startfile which opens with the default associated app
+            try:
+                os.startfile(fp)
+                return jsonify({"ok": True})
+            except Exception as e:
+                return jsonify({"error": f"Premiere Pro not found: {e}"}), 500
+    else:
+        result = subprocess.run(
+            ["open", "-a", "Adobe Premiere Pro", fp],
+            capture_output=True, text=True
+        )
     if result.returncode != 0:
         return jsonify({"error": result.stderr.strip() or "Premiere Pro not found"}), 500
     return jsonify({"ok": True})
@@ -965,7 +1212,7 @@ def send_to_folder():
 
 @app.route("/api/pick-folder", methods=["POST"])
 def pick_folder():
-    """Open a native macOS folder picker via osascript."""
+    """Open a native folder picker (macOS: osascript, Windows: tkinter)."""
     data       = request.get_json() or {}
     start_path = data.get("start_path", "~")
 
@@ -975,25 +1222,36 @@ def pick_folder():
         start_path = str(Path.home())
 
     try:
-        # 'choose folder' is a Standard Additions command.
-        # Use separate -e flags (one per statement) — more reliable than a
-        # single multi-line -e string.  Do NOT send Apple Events to Finder or
-        # System Events; those trigger TCC permission prompts that silently fail
-        # when the process is running in the background from a .app bundle.
-        result = subprocess.run(
-            [
-                "osascript",
-                "-e", f'set chosen to choose folder with prompt "Select a folder" default location POSIX file "{start_path}"',
-                "-e", "return POSIX path of chosen",
-            ],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0:
-            path = result.stdout.strip()
+        if IS_WINDOWS:
+            # Use tkinter's folder dialog (runs in a separate thread to avoid blocking)
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            path = filedialog.askdirectory(
+                title="Select a folder",
+                initialdir=start_path
+            )
+            root.destroy()
             if path:
-                return jsonify({"path": path, "type": "folder"})
-        # User cancelled (osascript exits non-zero on cancel)
-        return jsonify({"error": "cancelled"}), 400
+                return jsonify({"path": path.replace("/", "\\") + "\\", "type": "folder"})
+            return jsonify({"error": "cancelled"}), 400
+        else:
+            # macOS: use osascript
+            result = subprocess.run(
+                [
+                    "osascript",
+                    "-e", f'set chosen to choose folder with prompt "Select a folder" default location POSIX file "{start_path}"',
+                    "-e", "return POSIX path of chosen",
+                ],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip()
+                if path:
+                    return jsonify({"path": path, "type": "folder"})
+            return jsonify({"error": "cancelled"}), 400
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Picker timed out"}), 408
     except Exception as e:
@@ -1016,7 +1274,7 @@ def check_path():
 
 @app.route("/api/pick-file", methods=["POST"])
 def pick_file():
-    """Open a native macOS FILE picker via osascript."""
+    """Open a native file picker (macOS: osascript, Windows: tkinter)."""
     data       = request.get_json() or {}
     start_path = data.get("start_path", "~")
     file_types = data.get("file_types", [])   # e.g. ["db"] or ["jpg","jpeg","png"]
@@ -1025,30 +1283,47 @@ def pick_file():
     if not Path(start_path).exists():
         start_path = str(Path.home())
 
-    # Build optional type filter clause
-    if file_types:
-        # osascript file type filter uses UTIs or file extensions
-        ext_list = "{" + ", ".join(f'"{e}"' for e in file_types) + "}"
-        type_clause = f" of type {ext_list}"
-    else:
-        type_clause = ""
-
     try:
-        # Same approach as pick-folder: separate -e flags, no Apple Events to
-        # Finder/System Events (avoids TCC permission failures from background).
-        result = subprocess.run(
-            [
-                "osascript",
-                "-e", f'set chosen to choose file with prompt "Select a file"{type_clause} default location POSIX file "{start_path}"',
-                "-e", "return POSIX path of chosen",
-            ],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0:
-            path = result.stdout.strip()
+        if IS_WINDOWS:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            # Build file type filter for tkinter
+            if file_types:
+                ft = [("Allowed files", " ".join(f"*.{e}" for e in file_types))]
+            else:
+                ft = [("All files", "*.*")]
+            path = filedialog.askopenfilename(
+                title="Select a file",
+                initialdir=start_path,
+                filetypes=ft + [("All files", "*.*")]
+            )
+            root.destroy()
             if path:
-                return jsonify({"path": path, "type": "file"})
-        return jsonify({"error": "cancelled"}), 400
+                return jsonify({"path": path.replace("/", "\\"), "type": "file"})
+            return jsonify({"error": "cancelled"}), 400
+        else:
+            # macOS: osascript file picker
+            if file_types:
+                ext_list = "{" + ", ".join(f'"{e}"' for e in file_types) + "}"
+                type_clause = f" of type {ext_list}"
+            else:
+                type_clause = ""
+            result = subprocess.run(
+                [
+                    "osascript",
+                    "-e", f'set chosen to choose file with prompt "Select a file"{type_clause} default location POSIX file "{start_path}"',
+                    "-e", "return POSIX path of chosen",
+                ],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip()
+                if path:
+                    return jsonify({"path": path, "type": "file"})
+            return jsonify({"error": "cancelled"}), 400
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Picker timed out"}), 408
     except Exception as e:
@@ -1444,9 +1719,13 @@ def apply_update():
         # 5. Schedule a restart — kill the Flask process after a short delay
         #    so the response can be sent back to the client first
         def _restart():
-            import signal
             time.sleep(2)
-            os.kill(os.getpid(), signal.SIGTERM)
+            if IS_WINDOWS:
+                # On Windows, SIGTERM doesn't work reliably; use os._exit
+                os._exit(0)
+            else:
+                import signal
+                os.kill(os.getpid(), signal.SIGTERM)
 
         threading.Thread(target=_restart, daemon=True).start()
 
@@ -1790,6 +2069,325 @@ HTML_TEMPLATE = r"""
   .status-stopped { background: rgba(234,179,8,.15); color: var(--warn); }
   .status-running { background: rgba(249,115,22,.15); color: var(--accent); }
 
+  /* ── History cards (v13.6 redesign) ── */
+  .history-card {
+    background: var(--card, #0E1118);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 14px;
+    transition: border-color 0.2s ease;
+  }
+  .history-card:hover { border-color: rgba(240,112,32,0.25); }
+  .hc-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 10px;
+  }
+  .hc-folder {
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+    font-size: 13px;
+    color: var(--text, #E8EAF0);
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hc-folder .hc-emoji { font-size: 15px; flex-shrink: 0; }
+  .hc-meta {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    display: flex;
+    gap: 10px;
+  }
+  .hc-meta .hc-dot { opacity: 0.5; }
+  .hc-stats {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .hc-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .hc-pill-tagged  { background: rgba(52,211,153,0.10); color: #34D399; border: 1px solid rgba(52,211,153,0.22); }
+  .hc-pill-skipped { background: rgba(107,114,128,0.12); color: #6B7280; border: 1px solid rgba(107,114,128,0.25); }
+  .hc-pill-errors  { background: rgba(248,113,113,0.10); color: #F87171; border: 1px solid rgba(248,113,113,0.22); }
+  .hc-pill-cost    { background: rgba(245,166,35,0.10);  color: #F5A623; border: 1px solid rgba(245,166,35,0.22); }
+  .hc-actions { display: flex; gap: 8px; margin-top: 4px; }
+  .hc-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text, #E8EAF0);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .hc-btn:hover { background: rgba(255,255,255,0.04); border-color: rgba(240,112,32,0.3); }
+  .hc-btn-primary { border-color: rgba(240,112,32,0.4); color: #F07020; }
+  .hc-btn-primary:hover { background: rgba(240,112,32,0.08); border-color: #F07020; }
+  .hc-expanded {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    display: none;
+  }
+  .hc-expanded.show { display: block; }
+  .hc-section { margin-bottom: 14px; }
+  .hc-section:last-child { margin-bottom: 0; }
+  .hc-section-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #F07020;
+    margin-bottom: 6px;
+  }
+  .hc-api-detail {
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    color: var(--text, #E8EAF0);
+    line-height: 1.7;
+  }
+  .hc-api-detail span { color: var(--muted); }
+  .hc-err-summary { font-size: 11px; color: var(--muted); margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+  .hc-err-list { list-style: none; padding: 0; margin: 0; }
+  .hc-err-group {
+    background: rgba(248,113,113,0.04);
+    border-left: 2px solid rgba(248,113,113,0.3);
+    border-radius: 0 6px 6px 0;
+    margin-bottom: 6px;
+    overflow: hidden;
+    transition: background 0.15s ease;
+  }
+  .hc-err-group:hover { background: rgba(248,113,113,0.07); }
+  .hc-err-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .hc-err-msg {
+    font-size: 12.5px;
+    color: var(--text, #E8EAF0);
+    line-height: 1.4;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hc-err-count {
+    flex-shrink: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: #F87171;
+    background: rgba(248,113,113,0.12);
+    border: 1px solid rgba(248,113,113,0.25);
+    padding: 2px 8px;
+    border-radius: 999px;
+    min-width: 36px;
+    text-align: center;
+  }
+  .hc-err-chev {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 11px;
+    transition: transform 0.15s ease;
+  }
+  .hc-err-group.open .hc-err-chev { transform: rotate(90deg); }
+  .hc-err-files {
+    display: none;
+    padding: 4px 12px 10px 12px;
+    border-top: 1px dashed rgba(255,255,255,0.05);
+  }
+  .hc-err-group.open .hc-err-files { display: block; }
+  .hc-err-files ul {
+    list-style: none;
+    padding: 0; margin: 6px 0 0 0;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .hc-err-files li {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: var(--muted);
+    padding: 2px 0;
+    line-height: 1.5;
+    word-break: break-all;
+  }
+  .hc-err-files li::before { content: "› "; color: #F87171; opacity: 0.6; }
+  .hc-running-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #60A5FA;
+    margin-right: 4px;
+    animation: hc-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes hc-pulse {
+    0%, 100% { opacity: 0.4; transform: scale(0.9); }
+    50%      { opacity: 1;   transform: scale(1.1); }
+  }
+  .hc-running-line { color: var(--info); font-size: 12px; margin-bottom: 12px; }
+  .hc-legacy-summary { color: var(--muted); font-size: 12px; margin-bottom: 12px; font-style: italic; }
+
+  /* ── Log modal ── */
+  .hc-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(6px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+  }
+  .hc-modal-overlay.show { display: flex; }
+  .hc-modal {
+    background: #0E1118;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 900px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  .hc-modal-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #141820;
+  }
+  .hc-modal-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #FFFFFF;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .hc-modal-title .hc-job-id {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    background: #1E2530;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .hc-modal-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 22px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+  }
+  .hc-modal-close:hover { color: #FFFFFF; }
+  .hc-modal-toolbar {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .hc-log-search {
+    flex: 1;
+    background: #141820;
+    border: 1px solid var(--border);
+    color: var(--text, #E8EAF0);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 8px;
+    outline: none;
+  }
+  .hc-log-search:focus { border-color: #F07020; }
+  .hc-match-count {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .hc-modal-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    background: #080A0F;
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--text, #E8EAF0);
+  }
+  .hc-log-line { white-space: pre-wrap; word-break: break-word; }
+  .hc-log-line.err { color: #F87171; }
+  .hc-log-line.wrn { color: #FBBF24; }
+  .hc-log-line.suc { color: #34D399; }
+  .hc-log-line.inf { color: #60A5FA; }
+  .hc-log-line.cst { color: #F5A623; }
+  .hc-log-line.mgc { color: #E879F9; }
+  .hc-log-line mark {
+    background: rgba(245,166,35,0.3);
+    color: #F5A623;
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+  .hc-modal-body::-webkit-scrollbar { width: 10px; }
+  .hc-modal-body::-webkit-scrollbar-track { background: #080A0F; }
+  .hc-modal-body::-webkit-scrollbar-thumb { background: #1E2530; border-radius: 5px; }
+  .hc-modal-body::-webkit-scrollbar-thumb:hover { background: #2a2f3a; }
+  .hc-toast {
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    background: #141820;
+    border: 1px solid #34D399;
+    color: #34D399;
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.25s ease;
+    z-index: 2000;
+  }
+  .hc-toast.show { opacity: 1; transform: translateY(0); }
+
   /* Folder input with button */
   .folder-row { display: flex; gap: 8px; }
   .folder-row input { flex: 1; }
@@ -1828,7 +2426,7 @@ HTML_TEMPLATE = r"""
   ::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
 </style>
 </head>
-<body x-data="app()" x-init="init()">
+<body x-data="app()" x-init="init()" @keydown.escape.window="if (logModalOpen) closeLogModal()">
 
 <!-- ── Update banner ───────────────────────────────────────────────────── -->
 <div x-data="updateBanner()" x-init="check()"
@@ -2311,6 +2909,16 @@ HTML_TEMPLATE = r"""
               <div class="scrub-bar" :style="{width: (r._scrubPct || 0) + '%'}"></div>
               <div class="scrub-timecode" x-text="(r._scrubPct || 0) + '%'"></div>
             </div>
+            <!-- Image preview (JPG, ARW, PNG etc.) -->
+            <div x-show="r.file_type === 'image'" x-init="if(r.file_type==='image') loadThumbs(r)" style="margin-bottom:12px;">
+              <template x-if="r._thumbs && r._thumbs.length">
+                <img :src="'/api/thumbnail?path=' + encodeURIComponent(r._thumbs[0])" style="width:100%;max-height:200px;object-fit:cover;border-radius:6px;background:#000;">
+              </template>
+              <div x-show="!(r._thumbs && r._thumbs.length) && r._thumbsLoaded" class="scrub-placeholder" style="height:80px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--card);">
+                <div style="font-size:16px;">📷</div>
+                <div style="margin-left:8px;font-size:11px;color:var(--muted);">Preview available after retagging</div>
+              </div>
+            </div>
                         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px">
               <div class="result-filename" x-text="r.filename"></div>
               <span class="badge" :class="r.file_type==='video' ? 'badge-video' : 'badge-image'" x-text="r.file_type"></span>
@@ -2337,7 +2945,7 @@ HTML_TEMPLATE = r"""
               </template>
             </div>
             <div class="result-actions">
-              <button class="result-btn" title="Reveal in Finder" @click.stop="revealFile(r.file_path)">📂</button>
+              <button class="result-btn" title="Reveal in File Manager" @click.stop="revealFile(r.file_path)">📂</button>
               <button class="result-btn" title="Open in Premiere Pro" @click.stop="openInPremiere(r.file_path)">🎬</button>
               <button class="result-btn" :title="settings.send_folder ? 'Send to ' + settings.send_folder : 'Set a destination folder above first'" :style="!settings.send_folder ? 'opacity:.45;cursor:not-allowed' : ''" @click.stop="settings.send_folder ? sendToFolder(r.file_path, r) : null">→ Send</button>
             </div>
@@ -2507,7 +3115,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
                   <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;">
                     <span class="clip-score" x-text="'Match ' + (clip._score || '—')"></span>
                     <div style="display:flex;gap:6px;">
-                      <button class="result-btn btn-sm" title="Reveal in Finder" @click="revealFile(clip.file_path)">📂</button>
+                      <button class="result-btn btn-sm" title="Reveal in File Manager" @click="revealFile(clip.file_path)">📂</button>
                       <button class="result-btn btn-sm"
                         :title="settings.send_folder ? 'Send to ' + settings.send_folder : 'Set destination above'"
                         :style="!settings.send_folder ? 'opacity:.45;cursor:not-allowed' : ''"
@@ -2536,30 +3144,133 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
         <div class="empty-icon">≡</div>
         <div class="empty-text">No runs yet — tag some footage first</div>
       </div>
-      <table class="history-table" x-show="historyRows.length">
-        <thead>
-          <tr>
-            <th>Folder</th>
-            <th>Started</th>
-            <th>Duration</th>
-            <th>Status</th>
-            <th>Summary</th>
-          </tr>
-        </thead>
-        <tbody>
-          <template x-for="h in historyRows" :key="h.job_id">
-            <tr>
-              <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="h.folder" x-text="h.folder ? h.folder.split('/').slice(-2).join('/') : '—'"></td>
-              <td x-text="h.started || '—'"></td>
-              <td x-text="duration(h.started, h.ended)"></td>
-              <td><span class="status-badge" :class="'status-' + (h.status||'error')" x-text="h.status || '—'"></span></td>
-              <td style="max-width:300px;color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="h.summary" x-text="h.summary || '—'"></td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+      <div x-show="historyRows.length">
+        <template x-for="h in historyRows" :key="h.job_id">
+          <div class="history-card">
+            <!-- Top row: folder path + status -->
+            <div class="hc-top">
+              <div class="hc-folder" :title="h.folder || ''">
+                <span class="hc-emoji">📁</span>
+                <span x-text="h.folder ? h.folder.split('/').filter(Boolean).slice(-2).join('/') : '—'"></span>
+              </div>
+              <span class="status-badge" :class="'status-' + (h.status||'error')">
+                <template x-if="h.status === 'running'"><span class="hc-running-dot"></span></template>
+                <span x-text="h.status || '—'"></span>
+              </span>
+            </div>
+
+            <!-- Meta: started + duration -->
+            <div class="hc-meta">
+              <span x-text="h.started || '—'"></span>
+              <span class="hc-dot">·</span>
+              <span x-text="duration(h.started, h.ended) + (h.status==='running' ? ' · running…' : '')"></span>
+            </div>
+
+            <!-- Stats -->
+            <template x-if="h.status === 'running'">
+              <div class="hc-running-line">In progress — this card will update when the run finishes.</div>
+            </template>
+
+            <template x-if="h.status !== 'running' && h.stats">
+              <div class="hc-stats">
+                <span class="hc-pill hc-pill-tagged" x-text="'✓ ' + (h.stats.tagged||0) + ' tagged'"></span>
+                <span class="hc-pill hc-pill-skipped" x-text="'⊘ ' + (h.stats.skipped||0) + ' skipped'"></span>
+                <template x-if="(h.stats.errors_count||0) > 0 || (h.errors && h.errors.length)">
+                  <span class="hc-pill hc-pill-errors"
+                        x-text="'✗ ' + ((h.stats.errors_count!=null ? h.stats.errors_count : (h.errors||[]).length)) + ' error' + (((h.stats.errors_count!=null ? h.stats.errors_count : (h.errors||[]).length)===1)?'':'s')"></span>
+                </template>
+                <template x-if="(h.stats.cost_usd||0) > 0">
+                  <span class="hc-pill hc-pill-cost" x-text="'💰 $' + (h.stats.cost_usd).toFixed(4)"></span>
+                </template>
+              </div>
+            </template>
+
+            <template x-if="h.status !== 'running' && !h.stats && h.summary">
+              <div class="hc-legacy-summary" x-text="'Legacy entry: ' + h.summary"></div>
+            </template>
+
+            <!-- Actions -->
+            <div class="hc-actions">
+              <template x-if="(h.stats && (h.stats.api_calls > 0)) || (h.errors && h.errors.length) || (h.stats && h.stats.errors_count > 0)">
+                <button class="hc-btn" @click="toggleHistoryExpand(h.job_id)">
+                  <span x-text="expandedCards[h.job_id] ? '▴ Collapse' : '▾ Expand'"></span>
+                </button>
+              </template>
+              <template x-if="h.has_log">
+                <button class="hc-btn hc-btn-primary" @click="openJobLog(h.job_id)">📄 View Full Log</button>
+              </template>
+            </div>
+
+            <!-- Expanded -->
+            <div class="hc-expanded" :class="{'show': expandedCards[h.job_id]}">
+              <template x-if="h.stats && h.stats.api_calls > 0">
+                <div class="hc-section">
+                  <div class="hc-section-label">Gemini API</div>
+                  <div class="hc-api-detail">
+                    <span x-text="h.stats.api_calls + ' calls'"></span>
+                    <span>·</span>
+                    <span x-text="(h.stats.input_tokens||0).toLocaleString() + ' input tokens'"></span>
+                    <span>·</span>
+                    <span x-text="(h.stats.output_tokens||0).toLocaleString() + ' output tokens'"></span>
+                  </div>
+                </div>
+              </template>
+
+              <template x-if="h.errors && h.errors.length">
+                <div class="hc-section">
+                  <div class="hc-section-label"
+                       x-text="'Errors (' + groupErrors(h.errors).length + ' unique · ' + h.errors.length + ' total)'"></div>
+                  <div class="hc-err-summary">Click a row to see the affected files.</div>
+                  <ul class="hc-err-list">
+                    <template x-for="(g, gi) in groupErrors(h.errors)" :key="h.job_id + '-' + gi">
+                      <li class="hc-err-group" :class="{'open': expandedErrGroups[h.job_id + '-' + gi]}">
+                        <div class="hc-err-head" @click="toggleErrorGroup(h.job_id, gi)">
+                          <span class="hc-err-msg" x-text="g.message"></span>
+                          <span class="hc-err-count" x-text="'×' + g.count"></span>
+                          <span class="hc-err-chev">▸</span>
+                        </div>
+                        <div class="hc-err-files">
+                          <ul>
+                            <template x-for="f in g.files" :key="f">
+                              <li x-text="f"></li>
+                            </template>
+                          </ul>
+                        </div>
+                      </li>
+                    </template>
+                  </ul>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
     </div>
   </div>
+
+  <!-- ── Full Log Modal ─────────────────────────────────────────────────── -->
+  <div class="hc-modal-overlay" :class="{'show': logModalOpen}" @click.self="closeLogModal()">
+    <div class="hc-modal">
+      <div class="hc-modal-header">
+        <div class="hc-modal-title">
+          <span>Full Log</span>
+          <span class="hc-job-id" x-text="currentLogJobId || '—'"></span>
+        </div>
+        <button class="hc-modal-close" @click="closeLogModal()">×</button>
+      </div>
+      <div class="hc-modal-toolbar">
+        <input type="text" class="hc-log-search" placeholder="Search log (e.g. ERROR, ✓, clip_004)…"
+               x-model="logSearchQuery" @input="renderLog()">
+        <span class="hc-match-count" x-text="logMatchCount"></span>
+        <button class="hc-btn" @click="copyLog()">📋 Copy</button>
+        <button class="hc-btn" @click="downloadLog()">⬇ Download</button>
+      </div>
+      <div class="hc-modal-body" id="hc-log-body"></div>
+    </div>
+  </div>
+
+  <!-- ── Toast ──────────────────────────────────────────────────────────── -->
+  <div class="hc-toast" :class="{'show': toastVisible}" x-text="toastMsg"></div>
 
   <!-- ── Settings ───────────────────────────────────────────────────── -->
   <div class="view" :class="{active: view==='settings'}">
@@ -2716,10 +3427,10 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
         <div class="form-row">
           <div class="toggle-wrap" @click="settings.caffeinate=!settings.caffeinate">
             <div class="toggle" :class="{on: settings.caffeinate}"></div>
-            <span class="toggle-label">Caffeinate during tagging</span>
+            <span class="toggle-label">Prevent sleep during tagging</span>
           </div>
           <div style="font-size:11px;color:var(--muted);margin-top:6px;padding-left:46px">
-            Prevents your Mac from sleeping while a tagging job is running. Automatically stops when the job finishes.
+            Prevents your computer from sleeping while a tagging job is running. Automatically stops when the job finishes.
           </div>
         </div>
       </div>
@@ -2746,7 +3457,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
             <span class="toggle-label">Embed metadata into video files</span>
           </div>
           <div style="font-size:11px;color:var(--muted);margin-top:6px;padding-left:46px">
-            Writes the description, keywords, shot type, and camera movement directly inside the video file's metadata container (using ExifTool). The video image and audio are never touched — only the invisible metadata layer. This means the clip carries its tags with it wherever you copy it, and apps like QuickTime, VLC, and Finder's Get Info will show the description. Recommended on.
+            Writes the description, keywords, shot type, and camera movement directly inside the video file's metadata container (using ExifTool). The video image and audio are never touched — only the invisible metadata layer. This means the clip carries its tags with it wherever you copy it, and apps like QuickTime, VLC, and your file manager will show the description. Recommended on.
           </div>
         </div>
       </div>
@@ -2879,6 +3590,17 @@ function app() {
 
     // History
     historyRows: [],
+    expandedCards: {},          // { job_id: true/false } — which history cards are expanded
+    expandedErrGroups: {},      // { "jobId-index": true/false } — which error groups are open
+
+    // Log modal
+    logModalOpen: false,
+    currentLogText: '',
+    currentLogJobId: '',
+    logSearchQuery: '',
+    logMatchCount: '',
+    toastVisible: false,
+    toastMsg: '',
 
     // Script sourcing
     scriptText: '',
@@ -3307,6 +4029,132 @@ function app() {
       if (diff < 60) return diff + 's';
       if (diff < 3600) return Math.round(diff/60) + 'm ' + (diff%60) + 's';
       return Math.floor(diff/3600) + 'h ' + Math.round((diff%3600)/60) + 'm';
+    },
+
+    // ── History: expand / collapse card ──────────────────────────────────
+    toggleHistoryExpand(jobId) {
+      this.expandedCards[jobId] = !this.expandedCards[jobId];
+    },
+
+    toggleErrorGroup(jobId, idx) {
+      const key = jobId + '-' + idx;
+      this.expandedErrGroups[key] = !this.expandedErrGroups[key];
+    },
+
+    // ── Error grouping: bucket similar errors by stripping filenames ────
+    groupErrors(errors) {
+      if (!errors || !errors.length) return [];
+      const buckets = {};
+      for (const raw of errors) {
+        const { signature, file } = this.normaliseError(raw);
+        if (!buckets[signature]) {
+          buckets[signature] = { message: signature, count: 0, files: [] };
+        }
+        buckets[signature].count++;
+        if (file) buckets[signature].files.push(file);
+      }
+      return Object.values(buckets).sort((a, b) => b.count - a.count);
+    },
+
+    normaliseError(err) {
+      err = String(err || '').trim();
+      const patterns = [
+        /^(.+?)\s+on\s+(\S+\.\w{2,6})\s*$/i,
+        /^(.+?)\s+[—\-–]\s+(\S+\.\w{2,6})\s*$/i,
+        /^(.+?):\s+(\S+\.\w{2,6})\s*$/i,
+        /^(.+?)\s+for\s+(\S+\.\w{2,6})\s*$/i,
+        /^(.+?)\s+at\s+(\S+\.\w{2,6})\s*$/i,
+        /^(.+?)\s+(\S+\.\w{2,6})\s*$/i,
+      ];
+      for (const p of patterns) {
+        const m = err.match(p);
+        if (m) return { signature: m[1].trim(), file: m[2].trim() };
+      }
+      return { signature: err, file: null };
+    },
+
+    // ── Log modal ────────────────────────────────────────────────────────
+    async openJobLog(jobId) {
+      this.currentLogJobId = jobId;
+      this.logSearchQuery = '';
+      this.logMatchCount = '';
+      this.currentLogText = 'Loading…';
+      this.logModalOpen = true;
+      try {
+        const r = await fetch('/api/job-log/' + encodeURIComponent(jobId));
+        if (!r.ok) {
+          this.currentLogText = '(no log available for this run)';
+        } else {
+          this.currentLogText = await r.text();
+        }
+      } catch (e) {
+        this.currentLogText = '(error loading log: ' + e.message + ')';
+      }
+      this.$nextTick(() => this.renderLog());
+    },
+
+    closeLogModal() {
+      this.logModalOpen = false;
+    },
+
+    renderLog() {
+      const body = document.getElementById('hc-log-body');
+      if (!body) return;
+      const lines = (this.currentLogText || '').split('\n');
+      const q = (this.logSearchQuery || '').toLowerCase();
+      let matches = 0;
+
+      const esc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+      const html = lines.map(line => {
+        let cls = '';
+        if (line.includes('ERROR')) cls = 'err';
+        else if (line.includes('⚠')) cls = 'wrn';
+        else if (line.includes('✓')) cls = 'suc';
+        else if (line.includes('💰') || line.toLowerCase().includes('cost')) cls = 'cst';
+        else if (line.match(/\[(Video|Image) /)) cls = 'inf';
+        else if (line.toLowerCase().includes('gemini') || line.toLowerCase().includes('whisper')) cls = 'mgc';
+
+        let display = esc(line || ' ');
+        if (q && line.toLowerCase().includes(q)) {
+          matches++;
+          const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'gi');
+          display = display.replace(re, m => '<mark>' + m + '</mark>');
+        }
+        return '<div class="hc-log-line ' + cls + '">' + display + '</div>';
+      }).join('');
+
+      body.innerHTML = html;
+      this.logMatchCount = q ? (matches + ' match' + (matches===1?'':'es')) : '';
+    },
+
+    copyLog() {
+      if (!navigator.clipboard) {
+        this.showToast('Clipboard not available');
+        return;
+      }
+      navigator.clipboard.writeText(this.currentLogText || '').then(
+        () => this.showToast('Log copied to clipboard'),
+        () => this.showToast('Could not copy log')
+      );
+    },
+
+    downloadLog() {
+      const blob = new Blob([this.currentLogText || ''], {type: 'text/plain'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'metanas_job_' + (this.currentLogJobId || 'log') + '.log';
+      a.click();
+      URL.revokeObjectURL(url);
+      this.showToast('Log downloaded');
+    },
+
+    showToast(msg) {
+      this.toastMsg = msg;
+      this.toastVisible = true;
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toastVisible = false; }, 1800);
     }
   };
 }
@@ -3344,6 +4192,9 @@ if __name__ == "__main__":
     print()
     print("  Metadata Tagger for NAS Footage")
     print(f"  Open in your browser: http://localhost:5151")
-    print(f"  On your local network: http://<your-mac-ip>:5151")
+    if IS_WINDOWS:
+        print(f"  On your local network: http://<your-pc-ip>:5151")
+    else:
+        print(f"  On your local network: http://<your-mac-ip>:5151")
     print()
     app.run(host="0.0.0.0", port=5151, debug=False, threaded=True)
