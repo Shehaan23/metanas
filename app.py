@@ -91,7 +91,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "13.6.0"
+APP_VERSION = "14.0.0"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -658,6 +658,11 @@ def start_tag():
     if reprocess:
         cmd.append("--reprocess")
 
+    # Feature 1: Custom Preset Tags
+    custom_tags = data.get("custom_tags", "").strip()
+    if custom_tags:
+        cmd.extend(["--custom-tags", custom_tags])
+
     # ── Project-specific database support ─────────────────────────────
     # Resolve the project DB path so footage_tagger writes to the correct file.
     # If user chose a custom folder, use that; otherwise default to METANAS_HOME/project_dbs/
@@ -926,6 +931,48 @@ def stop_job(job_id):
         job["ended"]  = time.strftime("%Y-%m-%d %H:%M:%S")
         job["queue"].put(None)
     return jsonify({"ok": True})
+
+
+@app.route("/api/recent-tagged")
+def recent_tagged():
+    """Return clips tagged after a given timestamp — used by live progress UI."""
+    since   = request.args.get("since", "")
+    limit   = min(int(request.args.get("limit", "20")), 100)
+    config  = load_config()
+    db_path = request.args.get("db", config.get("db_path", ""))
+    if not db_path or not Path(db_path).exists():
+        return jsonify([])
+    try:
+        conn = sqlite3.connect(db_path)
+        sql  = ("SELECT file_path,file_type,camera_model,description,shot_type,"
+                "persons,tags,setting,lighting,mood,fps,processed_at,"
+                "camera_movement,time_of_day,audio_type,color_palette,mood_tags "
+                "FROM media_files WHERE processed_at >= ? "
+                "ORDER BY processed_at DESC LIMIT ?")
+        rows = conn.execute(sql, [since, limit]).fetchall()
+        results = []
+        for r in rows:
+            results.append({
+                "file_path":       r[0],  "file_type":    r[1],
+                "camera_model":    r[2] or "Unknown",
+                "description":     r[3] or "",  "shot_type":  r[4] or "",
+                "persons":         json.loads(r[5] or "[]"),
+                "tags":            json.loads(r[6] or "[]"),
+                "setting":         r[7] or "",   "lighting":   r[8] or "",
+                "mood":            r[9] or "",   "fps":        r[10] or "",
+                "processed_at":    r[11] or "",
+                "camera_movement": r[12] or "",
+                "time_of_day":     r[13] or "",
+                "audio_type":      r[14] or "",
+                "color_palette":   r[15] or "",
+                "mood_tags":       json.loads(r[16] or "[]"),
+                "filename":        Path(r[0]).name,
+                "folder":          Path(r[0]).parent.name,
+            })
+        conn.close()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify([])
 
 
 @app.route("/api/history")
@@ -2600,6 +2647,12 @@ HTML_TEMPLATE = r"""
             <div style="font-size:11px;color:var(--muted);margin-top:6px;padding-left:46px">When off, existing XMP files and DB records are never overwritten</div>
           </div>
 
+          <div class="form-row">
+            <label>Custom Tags</label>
+            <input type="text" x-model="customTags" placeholder="wedding, client: Sarah, Colombo" />
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">These tags are added to every clip in this run — great for project names, clients, locations</div>
+          </div>
+
           <!-- ── Project Database ────────────────────────────── -->
           <div style="border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:18px;background:var(--surface2)">
             <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:12px;font-weight:600">Project Database</div>
@@ -2694,6 +2747,40 @@ HTML_TEMPLATE = r"""
           </template>
           <div x-show="jobStatus==='running'" class="log-line" style="color:var(--muted)">_</div>
         </div>
+
+        <!-- ── Live tagged clips (real-time) ── -->
+        <div x-show="liveClips.length > 0" style="margin-top:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div style="font-size:13px;font-weight:600;color:var(--text)">
+              <span style="color:var(--success)">✓</span> Tagged so far: <span x-text="liveClipCount" style="color:var(--accent)"></span> clip(s)
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;max-height:320px;overflow-y:auto;padding:4px;">
+            <template x-for="(c, ci) in liveClips" :key="c.file_path">
+              <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden;transition:transform .15s;" @mouseenter="$el.style.transform='scale(1.03)'" @mouseleave="$el.style.transform='scale(1)'">
+                <div style="width:100%;height:90px;background:#111;display:flex;align-items:center;justify-content:center;overflow:hidden;">
+                  <template x-if="c._thumbs && c._thumbs.length">
+                    <img :src="'/api/thumbnail?path=' + encodeURIComponent(c._thumbs[0])" style="width:100%;height:100%;object-fit:cover;">
+                  </template>
+                  <template x-if="!c._thumbs || !c._thumbs.length">
+                    <span style="color:var(--muted);font-size:22px;" x-text="c.file_type === 'video' ? '🎬' : '📷'"></span>
+                  </template>
+                </div>
+                <div style="padding:6px 8px;">
+                  <div style="font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" x-text="c.filename" :title="c.filename"></div>
+                  <div style="font-size:10px;color:var(--muted);margin-top:2px;" x-text="(c.shot_type || '—') + ' · ' + (c.camera_movement || 'static')"></div>
+                  <div x-show="c.tags && c.tags.length" style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px;">
+                    <template x-for="t in (c.tags || []).slice(0,4)" :key="t">
+                      <span style="font-size:9px;background:var(--accent);color:var(--bg);padding:1px 5px;border-radius:10px;font-weight:600;" x-text="t"></span>
+                    </template>
+                    <span x-show="(c.tags||[]).length > 4" style="font-size:9px;color:var(--muted);" x-text="'+' + ((c.tags||[]).length - 4)"></span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -3317,6 +3404,16 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
             <option value="ollama">Ollama (local, free)</option>
           </select>
         </div>
+        <div class="form-row">
+          <label>Secondary Provider (Failover)</label>
+          <select x-model="settings.secondary_vision_provider">
+            <option value="">None — no failover</option>
+            <option value="gemini">Gemini 2.5 Flash</option>
+            <option value="openai">GPT-4o Vision</option>
+            <option value="ollama">Ollama (Local)</option>
+          </select>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">If the primary API fails on a clip, this provider takes over automatically</div>
+        </div>
         <div class="form-row-inline">
           <div class="form-row">
             <label>Gemini Model</label>
@@ -3386,6 +3483,13 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
           <div class="form-row">
             <label>Max Scenes / Clip</label>
             <input type="text" x-model="settings.max_scenes_per_clip" placeholder="8" />
+          </div>
+        </div>
+        <div class="form-row-inline">
+          <div class="form-row">
+            <label>Max Workers (Parallel Processing)</label>
+            <input type="number" x-model.number="settings.max_workers" placeholder="4" min="1" max="8" />
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Number of clips processed simultaneously (1-8). Higher = faster, but uses more API quota.</div>
           </div>
         </div>
         <div class="form-row">
@@ -3558,10 +3662,15 @@ function app() {
     tagFolder: '',
     tagProvider: 'gemini',
     tagReprocess: false,
+    customTags: '',
     tagError: '',
     activeJobId: null,
     jobStatus: '',
     logLines: [],
+    liveClips: [],
+    liveClipCount: 0,
+    jobStartedAt: '',
+    _liveTimer: null,
     folderHistory: JSON.parse(localStorage.getItem('mnFolderHistory') || '[]'),
 
     // Search
@@ -3700,6 +3809,7 @@ function app() {
           save_to_main:   this.saveToMain,
           project_db:     this.projectDbName.trim(),
           project_folder: this.projectDbFolder.trim(),
+          custom_tags:    this.customTags.trim(),
         })
       });
       const d = await r.json();
@@ -3712,7 +3822,11 @@ function app() {
       this.activeJobId = d.job_id;
       this.jobStatus   = 'running';
       this.logLines    = [];
+      this.liveClips   = [];
+      this.liveClipCount = 0;
+      this.jobStartedAt = new Date().toISOString().replace('T',' ').slice(0,19);
       this.streamLog(d.job_id);
+      this.startLiveClipPoll();
       // Refresh project DB list after job completes
       setTimeout(() => this.loadProjectDbs(), 3000);
     },
@@ -3726,6 +3840,8 @@ function app() {
           if (d.__done__) {
             this.jobStatus = d.status;
             es.close();
+            this.stopLiveClipPoll();
+            this.fetchLiveClips();
             this.loadStats();
             return;
           }
@@ -3751,7 +3867,40 @@ function app() {
       this.activeJobId = null;
       this.jobStatus   = '';
       this.logLines    = [];
+      this.liveClips   = [];
+      this.liveClipCount = 0;
       this.tagError    = '';
+      this.stopLiveClipPoll();
+    },
+
+    // ── Live clip polling ────────────────────────────────────────────
+    startLiveClipPoll() {
+      this.stopLiveClipPoll();
+      this._liveTimer = setInterval(() => this.fetchLiveClips(), 8000);
+    },
+    stopLiveClipPoll() {
+      if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
+    },
+    async fetchLiveClips() {
+      if (!this.jobStartedAt) return;
+      try {
+        const r = await fetch('/api/recent-tagged?since=' + encodeURIComponent(this.jobStartedAt) + '&limit=50');
+        const clips = await r.json();
+        if (Array.isArray(clips)) {
+          this.liveClips = clips;
+          this.liveClipCount = clips.length;
+          // Load thumbnails for new clips
+          for (const c of clips) {
+            if (!c._thumbs) {
+              try {
+                const tr = await fetch('/api/file-thumbnails?path=' + encodeURIComponent(c.file_path));
+                const td = await tr.json();
+                c._thumbs = td.thumbnails || [];
+              } catch(e) { c._thumbs = []; }
+            }
+          }
+        }
+      } catch(e) {}
     },
 
     logClass(line) {

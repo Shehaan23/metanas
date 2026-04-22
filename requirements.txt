@@ -1,0 +1,24 @@
+# METANAS — Python dependencies
+# Install via:  pip install -r requirements.txt
+# Or let install.sh handle it automatically.
+
+# Web server
+flask>=3.0.0
+
+# AI Vision providers
+openai>=1.30.0
+google-genai>=1.0.0
+
+# Image handling (required for Gemini)
+Pillow>=10.0.0
+
+# Video scene detection + keyframe extraction (numpy required by OpenCV)
+numpy>=1.24.0
+scenedetect[opencv]>=0.6.3
+
+# Audio transcription
+faster-whisper>=1.0.3
+
+# Utilities
+requests>=2.31.0
+pyyaml>=6.0.1

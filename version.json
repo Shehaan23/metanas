@@ -1,7 +1,5 @@
 {
-  "version": "13.6.0",
-  "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v13.6.0",
-  "release_notes": "History redesign\n\n• Replaced log-dump history with clear run summaries\n• At-a-glance stat pills: files tagged, skipped, errors, Gemini cost\n• Smart error grouping — 100s of duplicate errors collapse into counted rows\n• View Full Log modal with live search, copy, and download\n• Windows parity: .arw thumbnails now appear in the Search view\n• Minor Windows build + cross-platform polish",
-  "required": false
+  "latest_version": "14.0.0",
+  "release_notes": "v14.0.0 — Custom preset tags, dual API failover (Gemini + OpenAI), smart retry with exponential backoff, parallel multi-worker processing (1-8 threads), real-time tagged clips panel, per-clip cost & ETA logging.",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.0.0"
 }
