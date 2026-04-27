@@ -62,6 +62,12 @@ try:
 except Exception:
     GEMINI_AVAILABLE = False
 
+try:
+    import imagehash
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    IMAGEHASH_AVAILABLE = False
+
 # ── Cost tracker (Gemini 2.5 Flash pricing Apr 2026) ─────────────────────────
 # $0.15 / 1M input tokens, $0.60 / 1M output tokens
 # Each frame call ≈ 1 200 input tokens (image + prompt) + 400 output tokens
@@ -532,6 +538,22 @@ def transcribe_audio(file_path, config):
         return ""
 
 
+# ── Perceptual hashing ───────────────────────────────────────────────────────
+
+def _compute_phash(image_path):
+    """Compute a 64-bit perceptual hash and return as hex string (16 chars).
+    Returns None if imagehash or PIL is unavailable."""
+    if not IMAGEHASH_AVAILABLE:
+        return None
+    try:
+        img = PIL.Image.open(image_path)
+        h = imagehash.phash(img)
+        return str(h)  # hex string e.g. 'a1b2c3d4e5f6a7b8'
+    except Exception as e:
+        log.warning(f"  Could not compute phash: {e}")
+        return None
+
+
 # ── Scene detection & keyframe extraction ────────────────────────────────────
 
 def extract_keyframes(file_path, config, tmp_dir):
@@ -789,6 +811,7 @@ def init_db(db_path):
             color_palette TEXT, mood_tags TEXT,
             tags TEXT, persons TEXT, transcription TEXT,
             vision_provider TEXT,
+            phash TEXT,
             processed_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -814,12 +837,12 @@ def upsert_db(conn, data):
             (file_path,file_type,camera_model,duration,fps,description,shot_type,
              subjects,setting,lighting,motion,mood,
              camera_movement,time_of_day,audio_type,color_palette,mood_tags,
-             tags,persons,transcription,vision_provider)
+             tags,persons,transcription,vision_provider,phash)
         VALUES
             (:file_path,:file_type,:camera_model,:duration,:fps,:description,:shot_type,
              :subjects,:setting,:lighting,:motion,:mood,
              :camera_movement,:time_of_day,:audio_type,:color_palette,:mood_tags,
-             :tags,:persons,:transcription,:vision_provider)
+             :tags,:persons,:transcription,:vision_provider,:phash)
         ON CONFLICT(file_path) DO UPDATE SET
             camera_model=excluded.camera_model, duration=excluded.duration,
             fps=excluded.fps, description=excluded.description,
@@ -835,6 +858,7 @@ def upsert_db(conn, data):
             tags=excluded.tags,
             persons=excluded.persons, transcription=excluded.transcription,
             vision_provider=excluded.vision_provider,
+            phash=excluded.phash,
             processed_at=datetime('now')
     """, data)
     conn.commit()
@@ -911,8 +935,12 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
                 log.info(f"  ✓ {len(frames)} thumbnail(s) saved for preview")
             except Exception as e:
                 log.warning(f"  Could not save thumbnails: {e}")
+
+            # ── Compute perceptual hash from first keyframe ──
+            phash_hex = _compute_phash(frames[0])
         else:
             log.warning("  No keyframes extracted")
+            phash_hex = None
 
     persons = safe_str_list(ai_meta.get("identified_persons", []))
     if persons:
@@ -978,6 +1006,7 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
         "tags": json.dumps(metadata["tags"]),
         "persons": json.dumps(persons),
         "transcription": transcription, "vision_provider": provider_used,
+        "phash": phash_hex,
     })
 
 
@@ -994,12 +1023,14 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
     provider = config.get("vision_provider", "ollama")
     provider_used = provider
 
+    phash_hex = None
     if file_path.suffix.lower() == ".arw":
         with tempfile.TemporaryDirectory() as tmp:
             preview = Path(tmp) / (file_path.stem + "_preview.jpg")
             if extract_arw_preview(file_path, preview):
                 log.info("  ARW preview extracted")
                 ai_meta, provider_used = analyse_frame_with_failover(str(preview), config, reference_persons)
+                phash_hex = _compute_phash(str(preview))
                 # Save ARW preview as thumbnail for UI
                 try:
                     metanas_home = Path.home() / ".metanas"
@@ -1015,6 +1046,7 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
                 ai_meta = {}
     else:
         ai_meta, provider_used = analyse_frame_with_failover(str(file_path), config, reference_persons)
+        phash_hex = _compute_phash(str(file_path))
         # For standard images (jpg/png), create a thumbnail copy for the UI
         try:
             metanas_home = Path.home() / ".metanas"
@@ -1094,6 +1126,7 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
         "mood_tags": json.dumps(metadata["mood_tags"]),
         "tags": json.dumps(metadata["tags"]), "persons": json.dumps(persons),
         "transcription": "", "vision_provider": provider_used,
+        "phash": phash_hex,
     })
 
 
@@ -1239,13 +1272,6 @@ def main():
                 processed += count
                 if failed:
                     failed_files.append(failed)
-                # Per-clip cost + ETA (same as v13.6)
-                if processed > 0:
-                    total_files = len(all_files)
-                    eta = (time.time() - start) / max(processed, 1) * max(total_files - processed, 0) / 3600
-                    log.info(f"  ETA: {eta:.1f}h remaining for new files")
-                if config.get("vision_provider", "ollama").lower() == "gemini" and COST_TRACKER["calls"] > 0:
-                    log_gemini_cost()
             except Exception as e:
                 log.error(f"Worker exception: {e}")
 
