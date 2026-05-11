@@ -1,7 +1,7 @@
 {
-  "version": "13.5.0",
-  "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/app.py",
+  "version": "14.1.1",
+  "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
   "download_url": "https://github.com/Shehaan23/metanas/releases",
-  "release_notes": "Smart Search, thumbnail previews, dual DB write, DB path settings fix, Script Source filters.",
+  "release_notes": "Windows support, phash duplicate detection, database stability fixes (WAL mode), dependency auto-install.",
   "required": false
 }

@@ -19,12 +19,14 @@ Usage:
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import logging
 import re
 import sqlite3
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -57,11 +59,14 @@ try:
     from google.genai import types as google_genai_types
     import PIL.Image
     GEMINI_AVAILABLE = True
-except Exception as _gemini_import_err:
+except Exception:
     GEMINI_AVAILABLE = False
-    import sys as _sys
-    print(f"[GEMINI IMPORT FAILED] {type(_gemini_import_err).__name__}: {_gemini_import_err}",
-          file=_sys.stderr, flush=True)
+
+try:
+    import imagehash
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    IMAGEHASH_AVAILABLE = False
 
 # ── Cost tracker (Gemini 2.5 Flash pricing Apr 2026) ─────────────────────────
 # $0.15 / 1M input tokens, $0.60 / 1M output tokens
@@ -69,6 +74,10 @@ except Exception as _gemini_import_err:
 COST_TRACKER = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
 GEMINI_INPUT_PRICE  = 0.15 / 1_000_000   # $ per token
 GEMINI_OUTPUT_PRICE = 0.60 / 1_000_000   # $ per token
+
+# ── Throttling for API rate limiting (Feature 3) ────────────────────────────────
+LAST_API_CALL_TIME = {"timestamp": 0}
+MIN_API_INTERVAL = 4  # seconds between API calls (~15 req/min max)
 
 def log_gemini_cost(label=""):
     c = COST_TRACKER
@@ -230,18 +239,40 @@ def analyse_frame_with_openai(frame_path, api_key, model="gpt-4o",
     content.append({"type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64_frame}", "detail": "high"}})
     content.append({"type": "text", "text": "↑ Frame to analyse."})
-    for attempt in range(retries):
+    # Exponential backoff: [5, 15, 30, 60] seconds
+    retry_delays = [5, 15, 30, 60]
+    for attempt in range(4):  # max 4 retries
         try:
+            # Throttle API calls to stay under rate limits (~15 req/min)
+            elapsed = time.time() - LAST_API_CALL_TIME["timestamp"]
+            if elapsed < MIN_API_INTERVAL:
+                time.sleep(MIN_API_INTERVAL - elapsed)
+            LAST_API_CALL_TIME["timestamp"] = time.time()
+
             response = client.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": content}],
                 max_tokens=2048, temperature=0.2)
             return json.loads(clean_json(response.choices[0].message.content))
         except json.JSONDecodeError as e:
-            log.warning(f"GPT-4o JSON parse error (attempt {attempt+1}/3): {e}")
+            log.warning(f"GPT-4o JSON parse error (attempt {attempt+1}/4): {e}")
         except Exception as e:
-            log.warning(f"GPT-4o attempt {attempt+1}/3 failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+            # Detect rate limiting
+            error_str = str(e).lower()
+            if "429" in error_str or "rate" in error_str:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                log.warning(f"Rate limited — retrying in {delay}s")
+                if attempt < 4 - 1:
+                    time.sleep(delay)
+            elif "503" in error_str or "service" in error_str:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                log.warning(f"Service unavailable (503) — retrying in {delay}s")
+                if attempt < 4 - 1:
+                    time.sleep(delay)
+            else:
+                log.warning(f"GPT-4o attempt {attempt+1}/4 failed: {e}")
+                if attempt < 4 - 1:
+                    delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                    time.sleep(delay)
     return {}
 
 
@@ -270,8 +301,16 @@ def analyse_frame_with_gemini(frame_path, api_key, model="gemini-2.5-flash",
     except Exception as e:
         log.error(f"Could not open frame for Gemini: {e}")
         return {}
-    for attempt in range(retries):
+    # Exponential backoff: [5, 15, 30, 60] seconds
+    retry_delays = [5, 15, 30, 60]
+    for attempt in range(4):  # max 4 retries
         try:
+            # Throttle API calls to stay under rate limits (~15 req/min)
+            elapsed = time.time() - LAST_API_CALL_TIME["timestamp"]
+            if elapsed < MIN_API_INTERVAL:
+                time.sleep(MIN_API_INTERVAL - elapsed)
+            LAST_API_CALL_TIME["timestamp"] = time.time()
+
             response = client.models.generate_content(
                 model=model, contents=contents,
                 config=google_genai_types.GenerateContentConfig(
@@ -288,11 +327,25 @@ def analyse_frame_with_gemini(frame_path, api_key, model="gemini-2.5-flash",
                 COST_TRACKER["output_tokens"] += 400
             return json.loads(clean_json(response.text))
         except json.JSONDecodeError as e:
-            log.warning(f"Gemini JSON parse error (attempt {attempt+1}/3): {e}")
+            log.warning(f"Gemini JSON parse error (attempt {attempt+1}/4): {e}")
         except Exception as e:
-            log.warning(f"Gemini attempt {attempt+1}/3 failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+            # Detect rate limiting
+            error_str = str(e).lower()
+            if "429" in error_str or "rate" in error_str:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                log.warning(f"Rate limited — retrying in {delay}s")
+                if attempt < 4 - 1:
+                    time.sleep(delay)
+            elif "503" in error_str or "service" in error_str:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                log.warning(f"Service unavailable (503) — retrying in {delay}s")
+                if attempt < 4 - 1:
+                    time.sleep(delay)
+            else:
+                log.warning(f"Gemini attempt {attempt+1}/4 failed: {e}")
+                if attempt < 4 - 1:
+                    delay = retry_delays[attempt] if attempt < len(retry_delays) else 60
+                    time.sleep(delay)
     return {}
 
 
@@ -344,6 +397,54 @@ def analyse_frame(frame_path, config, reference_persons):
             frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
             model=config.get("ollama_vision_model", "llama3.2-vision"),
             reference_persons=reference_persons)
+
+
+def analyse_frame_with_failover(frame_path, config, reference_persons):
+    """Try primary provider, fall back to secondary if primary returns empty dict.
+    Returns (result_dict, provider_used_string)."""
+    primary = config.get("vision_provider", "ollama").lower()
+    secondary = config.get("secondary_vision_provider", "").lower() or ""
+
+    # Try primary provider
+    if primary == "openai":
+        result = analyse_frame_with_openai(
+            frame_path, api_key=config.get("openai_api_key", ""),
+            model=config.get("openai_vision_model", "gpt-4o"),
+            reference_persons=reference_persons)
+    elif primary == "gemini":
+        result = analyse_frame_with_gemini(
+            frame_path, api_key=config.get("gemini_api_key", ""),
+            model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+            reference_persons=reference_persons)
+    else:
+        result = analyse_frame_with_ollama(
+            frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
+            model=config.get("ollama_vision_model", "llama3.2-vision"),
+            reference_persons=reference_persons)
+
+    # If result is empty and secondary is configured, try secondary
+    if not result and secondary and secondary != "none":
+        log.warning(f"Primary provider ({primary}) failed, trying secondary ({secondary})")
+        if secondary == "openai":
+            result = analyse_frame_with_openai(
+                frame_path, api_key=config.get("openai_api_key", ""),
+                model=config.get("openai_vision_model", "gpt-4o"),
+                reference_persons=reference_persons)
+        elif secondary == "gemini":
+            result = analyse_frame_with_gemini(
+                frame_path, api_key=config.get("gemini_api_key", ""),
+                model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+                reference_persons=reference_persons)
+        else:
+            result = analyse_frame_with_ollama(
+                frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
+                model=config.get("ollama_vision_model", "llama3.2-vision"),
+                reference_persons=reference_persons)
+        provider_used = secondary if result else primary
+    else:
+        provider_used = primary
+
+    return result, provider_used
 
 
 # ── Technical metadata ────────────────────────────────────────────────────────
@@ -435,6 +536,22 @@ def transcribe_audio(file_path, config):
     except Exception as e:
         log.warning(f"Transcription failed for {file_path.name}: {e}")
         return ""
+
+
+# ── Perceptual hashing ───────────────────────────────────────────────────────
+
+def _compute_phash(image_path):
+    """Compute a 64-bit perceptual hash and return as hex string (16 chars).
+    Returns None if imagehash or PIL is unavailable."""
+    if not IMAGEHASH_AVAILABLE:
+        return None
+    try:
+        img = PIL.Image.open(image_path)
+        h = imagehash.phash(img)
+        return str(h)  # hex string e.g. 'a1b2c3d4e5f6a7b8'
+    except Exception as e:
+        log.warning(f"  Could not compute phash: {e}")
+        return None
 
 
 # ── Scene detection & keyframe extraction ────────────────────────────────────
@@ -682,7 +799,9 @@ def embed_metadata_in_image(media_path, metadata):
 # ── SQLite database ───────────────────────────────────────────────────────────
 
 def init_db(db_path):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS media_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -694,6 +813,7 @@ def init_db(db_path):
             color_palette TEXT, mood_tags TEXT,
             tags TEXT, persons TEXT, transcription TEXT,
             vision_provider TEXT,
+            phash TEXT,
             processed_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -710,6 +830,12 @@ def init_db(db_path):
         END
     """)
     conn.commit()
+    # Migrate: add phash column if missing (for DBs created before v14.1)
+    cursor = conn.execute("PRAGMA table_info(media_files)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "phash" not in columns:
+        conn.execute("ALTER TABLE media_files ADD COLUMN phash TEXT")
+        conn.commit()
     return conn
 
 
@@ -719,12 +845,12 @@ def upsert_db(conn, data):
             (file_path,file_type,camera_model,duration,fps,description,shot_type,
              subjects,setting,lighting,motion,mood,
              camera_movement,time_of_day,audio_type,color_palette,mood_tags,
-             tags,persons,transcription,vision_provider)
+             tags,persons,transcription,vision_provider,phash)
         VALUES
             (:file_path,:file_type,:camera_model,:duration,:fps,:description,:shot_type,
              :subjects,:setting,:lighting,:motion,:mood,
              :camera_movement,:time_of_day,:audio_type,:color_palette,:mood_tags,
-             :tags,:persons,:transcription,:vision_provider)
+             :tags,:persons,:transcription,:vision_provider,:phash)
         ON CONFLICT(file_path) DO UPDATE SET
             camera_model=excluded.camera_model, duration=excluded.duration,
             fps=excluded.fps, description=excluded.description,
@@ -740,6 +866,7 @@ def upsert_db(conn, data):
             tags=excluded.tags,
             persons=excluded.persons, transcription=excluded.transcription,
             vision_provider=excluded.vision_provider,
+            phash=excluded.phash,
             processed_at=datetime('now')
     """, data)
     conn.commit()
@@ -797,13 +924,31 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
     provider = config.get("vision_provider", "ollama")
 
     ai_meta = {}
+    provider_used = provider
     with tempfile.TemporaryDirectory() as tmp:
         frames = extract_keyframes(file_path, config, Path(tmp))
         if frames:
             log.info(f"  Analysing keyframe with {provider}…")
-            ai_meta = analyse_frame(frames[0], config, reference_persons)
+            ai_meta, provider_used = analyse_frame_with_failover(frames[0], config, reference_persons)
+
+            # ── Save keyframes to permanent thumbnails folder for UI preview ──
+            try:
+                metanas_home = Path.home() / ".metanas"
+                thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+                thumb_dir = thumb_base / file_path.stem
+                thumb_dir.mkdir(parents=True, exist_ok=True)
+                for i, frame_path in enumerate(frames):
+                    dest = thumb_dir / f"frame_{i:04d}.jpg"
+                    shutil.copy2(frame_path, dest)
+                log.info(f"  ✓ {len(frames)} thumbnail(s) saved for preview")
+            except Exception as e:
+                log.warning(f"  Could not save thumbnails: {e}")
+
+            # ── Compute perceptual hash from first keyframe ──
+            phash_hex = _compute_phash(frames[0])
         else:
             log.warning("  No keyframes extracted")
+            phash_hex = None
 
     persons = safe_str_list(ai_meta.get("identified_persons", []))
     if persons:
@@ -815,6 +960,14 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
     if config.get("transcribe_audio", True) and tech.get("has_audio"):
         log.info("  Transcribing audio…")
         transcription = transcribe_audio(file_path, config)
+
+    # Parse custom tags from config (Feature 1: Custom Preset Tags)
+    custom_tags_str = config.get("custom_tags", "")
+    custom_tags_list = [t.strip() for t in custom_tags_str.split(",") if t.strip()] if custom_tags_str else []
+
+    # Extend tags with custom tags
+    ai_tags = safe_str_list(ai_meta.get("tags", []))
+    ai_tags.extend(custom_tags_list)
 
     metadata = {
         "description":        ai_meta.get("description", ""),
@@ -829,10 +982,11 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
         "audio_type":         ai_meta.get("audio_type", ""),
         "color_palette":      ai_meta.get("color_palette", ""),
         "mood_tags":          safe_str_list(ai_meta.get("mood_tags", [])),
-        "tags":               safe_str_list(ai_meta.get("tags", [])),
+        "tags":               ai_tags,
         "identified_persons": persons,
         "camera_model":       camera_model,
         "transcription":      transcription,
+        "custom_tags":        custom_tags_list,
     }
 
     # Write XMP sidecar (controlled by settings — default on)
@@ -859,7 +1013,8 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
         "mood_tags": json.dumps(metadata["mood_tags"]),
         "tags": json.dumps(metadata["tags"]),
         "persons": json.dumps(persons),
-        "transcription": transcription, "vision_provider": provider,
+        "transcription": transcription, "vision_provider": provider_used,
+        "phash": phash_hex,
     })
 
 
@@ -874,18 +1029,44 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
 
     log.info(f"Processing: {file_path.name}")
     provider = config.get("vision_provider", "ollama")
+    provider_used = provider
 
+    phash_hex = None
     if file_path.suffix.lower() == ".arw":
         with tempfile.TemporaryDirectory() as tmp:
             preview = Path(tmp) / (file_path.stem + "_preview.jpg")
             if extract_arw_preview(file_path, preview):
                 log.info("  ARW preview extracted")
-                ai_meta = analyse_frame(str(preview), config, reference_persons)
+                ai_meta, provider_used = analyse_frame_with_failover(str(preview), config, reference_persons)
+                phash_hex = _compute_phash(str(preview))
+                # Save ARW preview as thumbnail for UI
+                try:
+                    metanas_home = Path.home() / ".metanas"
+                    thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+                    thumb_dir = thumb_base / file_path.stem
+                    thumb_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(preview, thumb_dir / "frame_0000.jpg")
+                    log.info("  ✓ Thumbnail saved for preview")
+                except Exception as e:
+                    log.warning(f"  Could not save thumbnail: {e}")
             else:
                 log.warning("  Could not extract ARW preview — skipping vision")
                 ai_meta = {}
     else:
-        ai_meta = analyse_frame(str(file_path), config, reference_persons)
+        ai_meta, provider_used = analyse_frame_with_failover(str(file_path), config, reference_persons)
+        phash_hex = _compute_phash(str(file_path))
+        # For standard images (jpg/png), create a thumbnail copy for the UI
+        try:
+            metanas_home = Path.home() / ".metanas"
+            thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+            thumb_dir = thumb_base / file_path.stem
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+            dest = thumb_dir / "frame_0000.jpg"
+            if not dest.exists():
+                shutil.copy2(file_path, dest)
+                log.info("  ✓ Thumbnail saved for preview")
+        except Exception as e:
+            log.warning(f"  Could not save thumbnail: {e}")
 
     persons = safe_str_list(ai_meta.get("identified_persons", []))
     if persons:
@@ -905,6 +1086,14 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
     except Exception:
         pass
 
+    # Parse custom tags from config (Feature 1: Custom Preset Tags)
+    custom_tags_str = config.get("custom_tags", "")
+    custom_tags_list = [t.strip() for t in custom_tags_str.split(",") if t.strip()] if custom_tags_str else []
+
+    # Extend tags with custom tags
+    ai_tags = safe_str_list(ai_meta.get("tags", []))
+    ai_tags.extend(custom_tags_list)
+
     metadata = {
         "description":        ai_meta.get("description", ""),
         "shot_type":          ai_meta.get("shot_type", ""),
@@ -918,10 +1107,11 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
         "audio_type":         ai_meta.get("audio_type", ""),
         "color_palette":      ai_meta.get("color_palette", ""),
         "mood_tags":          safe_str_list(ai_meta.get("mood_tags", [])),
-        "tags":               safe_str_list(ai_meta.get("tags", [])),
+        "tags":               ai_tags,
         "identified_persons": persons,
         "camera_model":       camera_model,
         "transcription":      "",
+        "custom_tags":        custom_tags_list,
     }
 
     if config.get("write_xmp_sidecar", True):
@@ -943,7 +1133,8 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
         "color_palette": metadata["color_palette"],
         "mood_tags": json.dumps(metadata["mood_tags"]),
         "tags": json.dumps(metadata["tags"]), "persons": json.dumps(persons),
-        "transcription": "", "vision_provider": provider,
+        "transcription": "", "vision_provider": provider_used,
+        "phash": phash_hex,
     })
 
 
@@ -960,6 +1151,8 @@ def main():
                         help="Re-embed metadata into already-processed files")
     parser.add_argument("--db-path", default=None,
                         help="Override the database path (used for per-project DBs)")
+    parser.add_argument("--custom-tags", default=None,
+                        help="Comma-separated custom tags to add to all clips (Feature 1)")
     args = parser.parse_args()
 
     if not Path(args.config).exists():
@@ -973,6 +1166,11 @@ def main():
     if args.db_path:
         config["db_path"] = args.db_path
         log.info(f"Project DB: {args.db_path}")
+
+    # Custom tags from CLI (Feature 1: Custom Preset Tags)
+    if args.custom_tags:
+        config["custom_tags"] = args.custom_tags
+        log.info(f"Custom tags: {args.custom_tags}")
 
     provider = config.get("vision_provider", "ollama").lower()
     model_name = {
@@ -1037,30 +1235,79 @@ def main():
     start = time.time()
     processed = 0
 
-    for i, vp in enumerate(videos, 1):
-        skip, _ = already_processed(conn, vp)
-        log.info(f"\n[Video {i}/{len(videos)}] {vp.parent.name} / {vp.name}")
-        try:
-            process_video(vp, config, conn, reference_persons, args.reprocess)
-            if args.reprocess or not skip:
-                processed += 1
-        except Exception as e:
-            log.error(f"  ERROR: {e}")
-        if i > 0 and new_count > 0:
-            eta = (time.time() - start) / max(processed, 1) * max(new_count - processed, 0) / 3600
-            log.info(f"  ETA: {eta:.1f}h remaining for new files")
-        if config.get("vision_provider", "ollama").lower() == "gemini" and COST_TRACKER["calls"] > 0:
-            log_gemini_cost()
+    # Feature 4: Parallel Multi-Worker Processing
+    max_workers = config.get("max_workers", 4)
+    log.info(f"Using {max_workers} worker(s) for parallel processing")
 
-    for i, ip in enumerate(images, 1):
-        skip, _ = already_processed(conn, ip)
-        log.info(f"\n[Image {i}/{len(images)}] {ip.parent.name} / {ip.name}")
+    # Thread-safe lock for SQLite access (SQLite is not thread-safe by default)
+    import threading
+    _db_lock = threading.Lock()
+    failed_files = []  # Feature 3: track failed files for retry
+
+    def process_file_wrapper(file_type, file_index, total_index, file_path):
+        """Wrapper to process a single file and track progress."""
+        # Each thread gets its own DB connection for thread safety
+        thread_conn = sqlite3.connect(config["db_path"], timeout=30)
+                thread_conn.execute("PRAGMA journal_mode=WAL")
+                thread_conn.execute("PRAGMA busy_timeout=10000")
+        skip, _ = already_processed(thread_conn, file_path)
+        log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
         try:
-            process_image(ip, config, conn, reference_persons, args.reprocess)
+            if file_type == "Video":
+                process_video(file_path, config, thread_conn, reference_persons, args.reprocess)
+            else:
+                process_image(file_path, config, thread_conn, reference_persons, args.reprocess)
+            thread_conn.close()
             if args.reprocess or not skip:
-                processed += 1
+                return (1, None)
+            return (0, None)
         except Exception as e:
             log.error(f"  ERROR: {e}")
+            thread_conn.close()
+            return (0, (file_type, file_index, total_index, file_path))
+
+    # Build file list
+    all_files = []
+    for i, vp in enumerate(videos, 1):
+        all_files.append(("Video", i, len(videos), vp))
+    for i, ip in enumerate(images, 1):
+        all_files.append(("Image", i, len(images), ip))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_file_wrapper, ft, fi, ti, fp): (ft, fi, ti, fp)
+                   for ft, fi, ti, fp in all_files}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                count, failed = future.result()
+                processed += count
+                if failed:
+                    failed_files.append(failed)
+            except Exception as e:
+                log.error(f"Worker exception: {e}")
+
+    # Feature 3: Retry failed files
+    if failed_files:
+        log.info(f"\n── Retrying {len(failed_files)} failed file(s)… ──────────────────────────")
+        for ft, fi, ti, fp in failed_files:
+            log.info(f"  Retry: {fp.name}")
+            retry_conn = sqlite3.connect(config["db_path"], timeout=30)
+            retry_conn.execute("PRAGMA journal_mode=WAL")
+            retry_conn.execute("PRAGMA busy_timeout=10000")
+            try:
+                if ft == "Video":
+                    process_video(fp, config, retry_conn, reference_persons, args.reprocess)
+                else:
+                    process_image(fp, config, retry_conn, reference_persons, args.reprocess)
+                processed += 1
+                log.info(f"  ✓ Retry succeeded: {fp.name}")
+            except Exception as e:
+                log.error(f"  ✗ Retry failed: {fp.name} — {e}")
+            finally:
+                retry_conn.close()
+
+    # Log costs
+    if config.get("vision_provider", "ollama").lower() == "gemini" and COST_TRACKER["calls"] > 0:
+        log_gemini_cost()
 
     conn.close()
     elapsed = (time.time() - start) / 60
