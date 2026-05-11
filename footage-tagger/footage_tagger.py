@@ -1248,8 +1248,8 @@ def main():
         """Wrapper to process a single file and track progress."""
         # Each thread gets its own DB connection for thread safety
         thread_conn = sqlite3.connect(config["db_path"], timeout=30)
-                thread_conn.execute("PRAGMA journal_mode=WAL")
-                thread_conn.execute("PRAGMA busy_timeout=10000")
+        thread_conn.execute("PRAGMA journal_mode=WAL")
+        thread_conn.execute("PRAGMA busy_timeout=10000")
         skip, _ = already_processed(thread_conn, file_path)
         log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
         try:
