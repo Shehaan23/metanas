@@ -777,7 +777,9 @@ def embed_metadata_in_image(media_path, metadata):
 # ── SQLite database ───────────────────────────────────────────────────────────
 
 def init_db(db_path):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS media_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -788,10 +790,15 @@ def init_db(db_path):
             camera_movement TEXT, time_of_day TEXT, audio_type TEXT,
             color_palette TEXT, mood_tags TEXT,
             tags TEXT, persons TEXT, transcription TEXT,
-            vision_provider TEXT,
+            vision_provider TEXT, phash TEXT,
             processed_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Migration: add phash column if upgrading from older version
+    try:
+        conn.execute("ALTER TABLE media_files ADD COLUMN phash TEXT")
+    except Exception:
+        pass  # Column already exists
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
             file_path, description, subjects, setting, tags, persons, transcription,
@@ -1206,7 +1213,9 @@ def main():
     def process_file_wrapper(file_type, file_index, total_index, file_path):
         """Wrapper to process a single file and track progress."""
         # Each thread gets its own DB connection for thread safety
-        thread_conn = sqlite3.connect(config["db_path"])
+        thread_conn = sqlite3.connect(config["db_path"], timeout=30)
+        thread_conn.execute("PRAGMA journal_mode=WAL")
+        thread_conn.execute("PRAGMA busy_timeout=10000")
         skip, _ = already_processed(thread_conn, file_path)
         log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
         try:
@@ -1247,7 +1256,9 @@ def main():
         log.info(f"\n── Retrying {len(failed_files)} failed file(s)… ──────────────────────────")
         for ft, fi, ti, fp in failed_files:
             log.info(f"  Retry: {fp.name}")
-            retry_conn = sqlite3.connect(config["db_path"])
+            retry_conn = sqlite3.connect(config["db_path"], timeout=30)
+            retry_conn.execute("PRAGMA journal_mode=WAL")
+            retry_conn.execute("PRAGMA busy_timeout=10000")
             try:
                 if ft == "Video":
                     process_video(fp, config, retry_conn, reference_persons, args.reprocess)
