@@ -91,7 +91,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.1.0"
+APP_VERSION = "14.2.0"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -537,7 +537,6 @@ def migrate_db(db_path: str):
             ("audio_type",      "TEXT"),
             ("color_palette",   "TEXT"),
             ("mood_tags",       "TEXT"),
-            ("phash",           "TEXT"),
         ]
         existing = {row[1] for row in conn.execute("PRAGMA table_info(media_files)").fetchall()}
         for col, col_type in new_columns:
@@ -658,11 +657,11 @@ def start_tag():
               "--folder", folder]
     if reprocess:
         cmd.append("--reprocess")
+
     # Feature 1: Custom Preset Tags
     custom_tags = data.get("custom_tags", "").strip()
     if custom_tags:
         cmd.extend(["--custom-tags", custom_tags])
-
 
     # ── Project-specific database support ─────────────────────────────
     # Resolve the project DB path so footage_tagger writes to the correct file.
@@ -825,9 +824,23 @@ def start_tag():
                         data_cols = [c for c in cols if c != "id"]
                         placeholders = ", ".join("?" for _ in data_cols)
                         col_list = ", ".join(data_cols)
-                        main_conn = sqlite3.connect(main_db)
-                        # Ensure the main DB has the same table structure
-                        # (init_db is called at startup, but just in case)
+                        main_conn = sqlite3.connect(main_db, timeout=30)
+                        main_conn.execute("PRAGMA journal_mode=WAL")
+                        main_conn.execute("PRAGMA busy_timeout=10000")
+                        # Ensure the main DB has the table (fresh installs won't have it yet)
+                        main_conn.execute("""CREATE TABLE IF NOT EXISTS media_files (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            file_path TEXT UNIQUE NOT NULL,
+                            file_type TEXT, camera_model TEXT, duration REAL, fps REAL,
+                            description TEXT, shot_type TEXT, subjects TEXT,
+                            setting TEXT, lighting TEXT, motion TEXT, mood TEXT,
+                            camera_movement TEXT, time_of_day TEXT, audio_type TEXT,
+                            color_palette TEXT, mood_tags TEXT,
+                            tags TEXT, persons TEXT, transcription TEXT,
+                            vision_provider TEXT, phash TEXT,
+                            processed_at TEXT DEFAULT (datetime('now'))
+                        )""")
+                        main_conn.commit()
                         copied = 0
                         for row in rows:
                             vals = [row[c] for c in data_cols]
@@ -932,48 +945,6 @@ def stop_job(job_id):
         job["ended"]  = time.strftime("%Y-%m-%d %H:%M:%S")
         job["queue"].put(None)
     return jsonify({"ok": True})
-
-
-@app.route("/api/recent-tagged")
-def recent_tagged():
-    """Return clips tagged after a given timestamp — used by live progress UI."""
-    since   = request.args.get("since", "")
-    limit   = min(int(request.args.get("limit", "20")), 100)
-    config  = load_config()
-    db_path = request.args.get("db", config.get("db_path", ""))
-    if not db_path or not Path(db_path).exists():
-        return jsonify([])
-    try:
-        conn = sqlite3.connect(db_path)
-        sql  = ("SELECT file_path,file_type,camera_model,description,shot_type,"
-                "persons,tags,setting,lighting,mood,fps,processed_at,"
-                "camera_movement,time_of_day,audio_type,color_palette,mood_tags "
-                "FROM media_files WHERE processed_at >= ? "
-                "ORDER BY processed_at DESC LIMIT ?")
-        rows = conn.execute(sql, [since, limit]).fetchall()
-        results = []
-        for r in rows:
-            results.append({
-                "file_path":       r[0],  "file_type":    r[1],
-                "camera_model":    r[2] or "Unknown",
-                "description":     r[3] or "",  "shot_type":  r[4] or "",
-                "persons":         json.loads(r[5] or "[]"),
-                "tags":            json.loads(r[6] or "[]"),
-                "setting":         r[7] or "",   "lighting":   r[8] or "",
-                "mood":            r[9] or "",   "fps":        r[10] or "",
-                "processed_at":    r[11] or "",
-                "camera_movement": r[12] or "",
-                "time_of_day":     r[13] or "",
-                "audio_type":      r[14] or "",
-                "color_palette":   r[15] or "",
-                "mood_tags":       json.loads(r[16] or "[]"),
-                "filename":        Path(r[0]).name,
-                "folder":          Path(r[0]).parent.name,
-            })
-        conn.close()
-        return jsonify(results)
-    except Exception as e:
-        return jsonify([])
 
 
 @app.route("/api/history")
@@ -1096,17 +1067,6 @@ def search_api():
     fps             = request.args.get("fps", "")
     has_people      = request.args.get("has_people", "")
     db_param        = request.args.get("db", "")
-    hide_dupes      = request.args.get("hide_dupes", "false") == "true"
-
-    # ── Pagination params ───────────────────────────────────────────
-    try:
-        page     = max(1, int(request.args.get("page", 1)))
-        per_page = int(request.args.get("per_page", 50))
-        if per_page not in (25, 50, 100):
-            per_page = 50
-    except (ValueError, TypeError):
-        page, per_page = 1, 50
-    offset = (page - 1) * per_page
 
     config  = load_config()
     if db_param and Path(db_param).exists():
@@ -1137,11 +1097,11 @@ def search_api():
         if has_people == "yes":
             sql += f" AND {p}persons IS NOT NULL AND {p}persons != \'[]\' AND {p}persons != \'\'"
         elif has_people == "no":
-            sql += f" AND ({p}persons IS NULL OR {p}persons = \'[]\' OR {p}persons = \'\')"
+            sql += f" AND ({p}persons IS NULL OR {p}persons = \'[]\' OR {p}persons = \'\'"
         return sql, params
 
-    SEL  = "file_path,file_type,camera_model,description,shot_type,persons,tags,setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,audio_type,color_palette,mood_tags,phash"
-    MSEL = "m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags,m.phash"
+    SEL  = "file_path,file_type,camera_model,description,shot_type,persons,tags,setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,audio_type,color_palette,mood_tags"
+    MSEL = "m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags"
 
     # ── Smart search: expand query with AI synonyms ─────────────────
     expanded_query = None
@@ -1150,43 +1110,25 @@ def search_api():
 
     try:
         conn = sqlite3.connect(db_path)
-
-        # ── Check if phash column exists (backward compat) ──────────
-        cursor = conn.execute("PRAGMA table_info(media_files)")
-        col_names = [row[1] for row in cursor.fetchall()]
-        has_phash_col = "phash" in col_names
-        if not has_phash_col:
-            # Fall back to SEL/MSEL without phash
-            SEL  = SEL.replace(",phash", "")
-            MSEL = MSEL.replace(",m.phash", "")
-
         if person:
             sql, params = f"SELECT {SEL} FROM media_files WHERE LOWER(persons) LIKE ?", [f"%{person.lower()}%"]
             sql, params = _filters(sql, params)
-            order_clause = " ORDER BY processed_at DESC"
+            sql += " LIMIT 100"
         elif query:
             search_q = expanded_query if expanded_query else query
             sql = f"SELECT {MSEL} FROM media_fts f JOIN media_files m ON m.rowid=f.rowid WHERE media_fts MATCH ?"
             params = [search_q]
             sql, params = _filters(sql, params, "m.")
-            order_clause = ""
+            sql += " LIMIT 50"
         else:
             sql, params = f"SELECT {SEL} FROM media_files WHERE 1=1", []
             sql, params = _filters(sql, params)
-            order_clause = " ORDER BY processed_at DESC"
-
-        # ── Count total matching rows ───────────────────────────────
-        count_sql = f"SELECT COUNT(*) FROM ({sql})"
-        total = conn.execute(count_sql, params).fetchone()[0]
-
-        # ── Apply ordering + pagination ─────────────────────────────
-        sql += order_clause
-        sql += f" LIMIT {per_page} OFFSET {offset}"
+            sql += " ORDER BY processed_at DESC LIMIT 50"
 
         rows    = conn.execute(sql, params).fetchall()
         results = []
         for r in rows:
-            item = {
+            results.append({
                 "file_path":       r[0],  "file_type":    r[1],
                 "camera_model":    r[2] or "Unknown",
                 "description":     r[3] or "",  "shot_type":  r[4] or "",
@@ -1202,185 +1144,14 @@ def search_api():
                 "mood_tags":       json.loads(r[16] or "[]"),
                 "filename":        Path(r[0]).name,
                 "folder":          Path(r[0]).parent.name,
-            }
-            if has_phash_col:
-                item["phash"] = r[17] or ""
-            results.append(item)
-
-        # ── Duplicate grouping (if phash available & requested) ─────
-        if hide_dupes and has_phash_col:
-            results = _group_duplicates(results)
-            total = len(results)   # adjusted count after grouping
-
+            })
         conn.close()
-
-        total_pages = max(1, -(-total // per_page))  # ceil division
-
-        response = {
-            "results":     results,
-            "total":       total,
-            "page":        page,
-            "per_page":    per_page,
-            "total_pages": total_pages,
-        }
+        # Include expansion info so the UI can show what was searched
         if expanded_query and expanded_query != query:
-            response["expanded"] = expanded_query
-            response["original"] = query
-        return jsonify(response)
+            return jsonify({"results": results, "expanded": expanded_query, "original": query})
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-def _group_duplicates(results):
-    """Group results by perceptual hash similarity (Hamming distance ≤ 8).
-    Returns deduplicated list where each item may have a 'duplicates' array
-    and 'duplicate_count' field."""
-    if not results:
-        return results
-
-    # Separate items with and without phash
-    hashed   = [(i, r) for i, r in enumerate(results) if r.get("phash")]
-    unhashed = [r for r in results if not r.get("phash")]
-
-    if not hashed:
-        return results
-
-    def hamming(h1, h2):
-        """Hamming distance between two hex-encoded perceptual hashes."""
-        try:
-            i1, i2 = int(h1, 16), int(h2, 16)
-            return bin(i1 ^ i2).count("1")
-        except (ValueError, TypeError):
-            return 999
-
-    used    = set()
-    grouped = []
-    for idx, (i, item) in enumerate(hashed):
-        if i in used:
-            continue
-        used.add(i)
-        group_dupes = []
-        for j, other in hashed[idx + 1:]:
-            if j in used:
-                continue
-            if hamming(item["phash"], other["phash"]) <= 8:
-                used.add(j)
-                group_dupes.append(other)
-        item["duplicates"]      = group_dupes
-        item["duplicate_count"] = len(group_dupes)
-        grouped.append(item)
-
-    return grouped + unhashed
-
-
-@app.route("/api/similar")
-def similar_api():
-    """Return all clips with phash within Hamming distance 8 of the given hash."""
-    target_hash = request.args.get("phash", "").strip()
-    db_param    = request.args.get("db", "")
-    if not target_hash:
-        return jsonify({"error": "phash parameter required"}), 400
-
-    config  = load_config()
-    if db_param and Path(db_param).exists():
-        db_path = db_param
-    else:
-        db_path = config.get("db_path", "")
-    if not db_path or not Path(db_path).exists():
-        return jsonify({"error": "Database not found."}), 404
-
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT file_path,file_type,camera_model,description,shot_type,persons,tags,"
-            "setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,"
-            "audio_type,color_palette,mood_tags,phash FROM media_files WHERE phash IS NOT NULL"
-        ).fetchall()
-        conn.close()
-
-        target_int = int(target_hash, 16)
-        similar = []
-        for r in rows:
-            try:
-                h = int(r[17], 16)
-                dist = bin(target_int ^ h).count("1")
-            except (ValueError, TypeError):
-                continue
-            if dist <= 8:
-                similar.append({
-                    "file_path": r[0], "file_type": r[1],
-                    "camera_model": r[2] or "Unknown", "description": r[3] or "",
-                    "shot_type": r[4] or "", "persons": json.loads(r[5] or "[]"),
-                    "tags": json.loads(r[6] or "[]"), "setting": r[7] or "",
-                    "lighting": r[8] or "", "mood": r[9] or "", "fps": r[10] or "",
-                    "processed_at": r[11] or "", "camera_movement": r[12] or "",
-                    "time_of_day": r[13] or "", "audio_type": r[14] or "",
-                    "color_palette": r[15] or "", "mood_tags": json.loads(r[16] or "[]"),
-                    "phash": r[17] or "", "hamming_distance": dist,
-                    "filename": Path(r[0]).name, "folder": Path(r[0]).parent.name,
-                })
-        similar.sort(key=lambda x: x["hamming_distance"])
-        return jsonify(similar)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/backfill-phash", methods=["POST"])
-def backfill_phash():
-    """Compute perceptual hashes for all clips that don't have one yet.
-    Reads the first thumbnail from ~/.metanas/thumbnails/<stem>/frame_0000.jpg
-    and computes the phash. Runs synchronously — for large libraries this may
-    take a while, but it's a one-time operation."""
-    try:
-        import imagehash as _ih
-        from PIL import Image as _PILImg
-    except ImportError:
-        return jsonify({"error": "imagehash not installed. Run: pip install imagehash"}), 500
-
-    db_param = request.args.get("db", "")
-    config   = load_config()
-    if db_param and Path(db_param).exists():
-        db_path = db_param
-    else:
-        db_path = config.get("db_path", "")
-    if not db_path or not Path(db_path).exists():
-        return jsonify({"error": "Database not found."}), 404
-
-    migrate_db(db_path)
-    conn = sqlite3.connect(db_path)
-
-    metanas_home = Path.home() / ".metanas"
-    thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
-
-    rows = conn.execute(
-        "SELECT id, file_path FROM media_files WHERE phash IS NULL OR phash = ''"
-    ).fetchall()
-
-    updated = 0
-    errors  = 0
-    for row_id, file_path in rows:
-        stem = Path(file_path).stem
-        thumb = thumb_base / stem / "frame_0000.jpg"
-        img_path = None
-        if thumb.exists():
-            img_path = str(thumb)
-        elif Path(file_path).exists() and Path(file_path).suffix.lower() in ('.jpg', '.jpeg', '.png', '.tiff', '.bmp'):
-            img_path = file_path
-
-        if img_path:
-            try:
-                img = _PILImg.open(img_path)
-                h = str(_ih.phash(img))
-                conn.execute("UPDATE media_files SET phash = ? WHERE id = ?", (h, row_id))
-                updated += 1
-            except Exception:
-                errors += 1
-        else:
-            errors += 1
-
-    conn.commit()
-    conn.close()
-    return jsonify({"updated": updated, "errors": errors, "total": len(rows)})
 
 
 # ── File action routes ─────────────────────────────────────────────────────────
@@ -1917,7 +1688,7 @@ def trigger_update_check():
 
 @app.route("/api/apply-update", methods=["POST"])
 def apply_update():
-    """Download the latest app.py from GitHub and replace local copies, then restart."""
+    """Download the latest app.py + footage_tagger.py from GitHub, replace local copies, then restart."""
     import shutil
     global _update_info
 
@@ -1929,51 +1700,83 @@ def apply_update():
         return jsonify({"error": "No file_url in update manifest — update version.json on GitHub"}), 400
 
     try:
-        # 1. Download new app.py to a temp location
-        tmp_path = METANAS_HOME / "app_update.py.tmp"
+        bundle_root = BASE_DIR  # Contents/Resources/footage-tagger/
+        replaced = []
+
+        # 1. Download and replace app.py
+        tmp_app = METANAS_HOME / "app_update.py.tmp"
         req = urllib.request.Request(file_url, headers={"User-Agent": f"METANAS/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             new_code = resp.read()
 
-        # Sanity check — must contain APP_VERSION and Flask
         code_text = new_code.decode("utf-8", errors="replace")
         if "APP_VERSION" not in code_text or "Flask" not in code_text:
             return jsonify({"error": "Downloaded file does not look like a valid app.py"}), 400
 
-        with open(tmp_path, "wb") as f:
+        with open(tmp_app, "wb") as f:
             f.write(new_code)
 
-        # 2. Find all app.py locations in the bundle and replace them
-        bundle_root = BASE_DIR  # Contents/Resources/footage-tagger/
-        targets = [
-            bundle_root / "app.py",                       # footage-tagger/app.py
-            bundle_root.parent / "app.py",                # Resources/app.py
-        ]
-        replaced = []
-        for target in targets:
+        for target in [bundle_root / "app.py", bundle_root.parent / "app.py"]:
             if target.exists():
-                shutil.copy2(str(tmp_path), str(target))
+                shutil.copy2(str(tmp_app), str(target))
                 replaced.append(str(target))
+        tmp_app.unlink(missing_ok=True)
 
-        # 3. Clear __pycache__ in all relevant directories
+        # 2. Download and replace footage_tagger.py too
+        tagger_url = file_url.replace("/app.py", "/footage_tagger.py")
+        try:
+            tmp_tagger = METANAS_HOME / "tagger_update.py.tmp"
+            req2 = urllib.request.Request(tagger_url, headers={"User-Agent": f"METANAS/{APP_VERSION}"})
+            with urllib.request.urlopen(req2, timeout=60) as resp2:
+                tagger_code = resp2.read()
+            tagger_text = tagger_code.decode("utf-8", errors="replace")
+            if "def init_db" in tagger_text and "def upsert_db" in tagger_text:
+                with open(tmp_tagger, "wb") as f:
+                    f.write(tagger_code)
+                tagger_target = bundle_root / "footage_tagger.py"
+                if tagger_target.exists():
+                    shutil.copy2(str(tmp_tagger), str(tagger_target))
+                    replaced.append(str(tagger_target))
+                tmp_tagger.unlink(missing_ok=True)
+        except Exception:
+            pass  # tagger update is best-effort — app.py update is the critical one
+
+        # 3. Clear __pycache__
         for d in [bundle_root, bundle_root.parent]:
             cache_dir = d / "__pycache__"
             if cache_dir.exists():
                 shutil.rmtree(str(cache_dir), ignore_errors=True)
 
-        # 4. Clean up temp file
-        tmp_path.unlink(missing_ok=True)
-
-        # 5. Schedule a restart — kill the Flask process after a short delay
-        #    so the response can be sent back to the client first
+        # 4. Restart Flask by re-launching the process, then exiting this one
         def _restart():
             time.sleep(2)
-            if IS_WINDOWS:
-                # On Windows, SIGTERM doesn't work reliably; use os._exit
-                os._exit(0)
-            else:
-                import signal
-                os.kill(os.getpid(), signal.SIGTERM)
+            try:
+                # Re-launch app.py as a new process before killing this one
+                app_path = str(bundle_root / "app.py")
+                python_exe = sys.executable
+                if IS_WINDOWS:
+                    subprocess.Popen(
+                        [python_exe, app_path],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        cwd=str(bundle_root)
+                    )
+                    os._exit(0)
+                else:
+                    subprocess.Popen(
+                        [python_exe, app_path],
+                        cwd=str(bundle_root),
+                        stdout=open(str(METANAS_HOME / "metanas.log"), "a"),
+                        stderr=subprocess.STDOUT
+                    )
+                    import signal
+                    os.kill(os.getpid(), signal.SIGTERM)
+            except Exception:
+                # Fallback: just kill — user will need to relaunch manually
+                if IS_WINDOWS:
+                    os._exit(0)
+                else:
+                    import signal
+                    os.kill(os.getpid(), signal.SIGTERM)
 
         threading.Thread(target=_restart, daemon=True).start()
 
@@ -2848,6 +2651,12 @@ HTML_TEMPLATE = r"""
             <div style="font-size:11px;color:var(--muted);margin-top:6px;padding-left:46px">When off, existing XMP files and DB records are never overwritten</div>
           </div>
 
+          <div class="form-row">
+            <label>Custom Tags</label>
+            <input type="text" x-model="customTags" placeholder="wedding, client: Sarah, Colombo" />
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">These tags are added to every clip in this run — great for project names, clients, locations</div>
+          </div>
+
           <!-- ── Project Database ────────────────────────────── -->
           <div style="border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:18px;background:var(--surface2)">
             <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:12px;font-weight:600">Project Database</div>
@@ -2891,12 +2700,6 @@ HTML_TEMPLATE = r"""
           </div>
 
           <div x-show="tagError" class="alert alert-error" x-text="tagError"></div>
-
-          
-          <div style="margin-top:12px">
-            <label style="font-size:12px;font-weight:600;margin-bottom:4px;display:block">Custom Tags <span style="color:var(--muted);font-weight:400">(comma-separated, added to every clip)</span></label>
-            <input type="text" x-model="customTags" placeholder="e.g. Project Alpha, B-roll, Interview" style="width:100%;padding:8px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;">
-          </div>
 
           <button class="btn btn-primary" @click="startTag()"
             :disabled="!tagFolder.trim() || (!saveToMain && !projectDbName.trim())">
@@ -2951,39 +2754,6 @@ HTML_TEMPLATE = r"""
       </div>
     </div>
   </div>
-        <!-- ── Live tagged clips (real-time) ── -->
-        <div x-show="liveClips.length > 0" style="margin-top:16px">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-            <div style="font-size:13px;font-weight:600;color:var(--text)">
-              <span style="color:var(--success)">✓</span> Tagged so far: <span x-text="liveClipCount" style="color:var(--accent)"></span> clip(s)
-            </div>
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;max-height:320px;overflow-y:auto;padding:4px;">
-            <template x-for="(c, ci) in liveClips" :key="c.file_path">
-              <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden;transition:transform .15s;" @mouseenter="$el.style.transform='scale(1.03)'" @mouseleave="$el.style.transform='scale(1)'">
-                <div style="width:100%;height:90px;background:#111;display:flex;align-items:center;justify-content:center;overflow:hidden;">
-                  <template x-if="c._thumbs && c._thumbs.length">
-                    <img :src="'/api/thumbnail?path=' + encodeURIComponent(c._thumbs[0])" style="width:100%;height:100%;object-fit:cover;">
-                  </template>
-                  <template x-if="!c._thumbs || !c._thumbs.length">
-                    <span style="color:var(--muted);font-size:22px;" x-text="c.file_type === 'video' ? '🎬' : '📷'"></span>
-                  </template>
-                </div>
-                <div style="padding:6px 8px;">
-                  <div style="font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" x-text="c.filename" :title="c.filename"></div>
-                  <div style="font-size:10px;color:var(--muted);margin-top:2px;" x-text="(c.shot_type || '—') + ' · ' + (c.camera_movement || 'static')"></div>
-                  <div x-show="c.tags && c.tags.length" style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px;">
-                    <template x-for="t in (c.tags || []).slice(0,4)" :key="t">
-                      <span style="font-size:9px;background:var(--accent);color:var(--bg);padding:1px 5px;border-radius:10px;font-weight:600;" x-text="t"></span>
-                    </template>
-                    <span x-show="(c.tags||[]).length > 4" style="font-size:9px;color:var(--muted);" x-text="'+' + ((c.tags||[]).length - 4)"></span>
-                  </div>
-                </div>
-              </div>
-            </template>
-          </div>
-        </div>
-
 
   <!-- ── Search ─────────────────────────────────────────────────────── -->
   <div class="view" :class="{active: view==='search'}">
@@ -2997,7 +2767,7 @@ HTML_TEMPLATE = r"""
       <div x-show="showFilters" style="background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:16px; display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px; margin-bottom:16px;">
         <div>
           <label>File Type</label>
-          <select x-model="filters.file_type" @change="doSearch(true)">
+          <select x-model="filters.file_type" @change="doSearch()">
             <option value="">All</option>
             <option value="video">Video</option>
             <option value="image">Image</option>
@@ -3005,7 +2775,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Camera</label>
-          <select x-model="filters.camera" @change="doSearch(true)">
+          <select x-model="filters.camera" @change="doSearch()">
             <option value="">All</option>
             <template x-for="cam in filterOptions.cameras || []" :key="cam">
               <option :value="cam" x-text="cam"></option>
@@ -3014,7 +2784,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Shot Type</label>
-          <select x-model="filters.shot_type" @change="doSearch(true)">
+          <select x-model="filters.shot_type" @change="doSearch()">
             <option value="">All</option>
             <template x-for="st in filterOptions.shot_types || []" :key="st">
               <option :value="st" x-text="st"></option>
@@ -3023,7 +2793,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Camera Movement</label>
-          <select x-model="filters.camera_movement" @change="doSearch(true)">
+          <select x-model="filters.camera_movement" @change="doSearch()">
             <option value="">All</option>
             <template x-for="cm in filterOptions.camera_movements || []" :key="cm">
               <option :value="cm" x-text="cm"></option>
@@ -3032,7 +2802,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Time of Day</label>
-          <select x-model="filters.time_of_day" @change="doSearch(true)">
+          <select x-model="filters.time_of_day" @change="doSearch()">
             <option value="">All</option>
             <template x-for="t in filterOptions.time_of_day || []" :key="t">
               <option :value="t" x-text="t"></option>
@@ -3041,7 +2811,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Audio Type</label>
-          <select x-model="filters.audio_type" @change="doSearch(true)">
+          <select x-model="filters.audio_type" @change="doSearch()">
             <option value="">All</option>
             <template x-for="a in filterOptions.audio_types || []" :key="a">
               <option :value="a" x-text="a"></option>
@@ -3050,7 +2820,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Color Palette</label>
-          <select x-model="filters.color_palette" @change="doSearch(true)">
+          <select x-model="filters.color_palette" @change="doSearch()">
             <option value="">All</option>
             <template x-for="cp in filterOptions.color_palettes || []" :key="cp">
               <option :value="cp" x-text="cp"></option>
@@ -3059,7 +2829,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Setting/Location</label>
-          <select x-model="filters.setting" @change="doSearch(true)">
+          <select x-model="filters.setting" @change="doSearch()">
             <option value="">All</option>
             <template x-for="s in filterOptions.settings || []" :key="s">
               <option :value="s" x-text="s"></option>
@@ -3068,7 +2838,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Mood</label>
-          <select x-model="filters.mood" @change="doSearch(true)">
+          <select x-model="filters.mood" @change="doSearch()">
             <option value="">All</option>
             <template x-for="m in filterOptions.moods || []" :key="m">
               <option :value="m" x-text="m"></option>
@@ -3077,7 +2847,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Lighting</label>
-          <select x-model="filters.lighting" @change="doSearch(true)">
+          <select x-model="filters.lighting" @change="doSearch()">
             <option value="">All</option>
             <template x-for="l in filterOptions.lightings || []" :key="l">
               <option :value="l" x-text="l"></option>
@@ -3086,7 +2856,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>File Extension</label>
-          <select x-model="filters.file_ext" @change="doSearch(true)">
+          <select x-model="filters.file_ext" @change="doSearch()">
             <option value="">All</option>
             <template x-for="ex in filterOptions.extensions || []" :key="ex">
               <option :value="ex" x-text="ex"></option>
@@ -3095,7 +2865,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>Frame Rate</label>
-          <select x-model="filters.fps" @change="doSearch(true)">
+          <select x-model="filters.fps" @change="doSearch()">
             <option value="">All</option>
             <template x-for="f in filterOptions.fps_options || []" :key="f">
               <option :value="f" x-text="f + ' fps'"></option>
@@ -3104,7 +2874,7 @@ HTML_TEMPLATE = r"""
         </div>
         <div>
           <label>People in Shot</label>
-          <select x-model="filters.has_people" @change="doSearch(true)">
+          <select x-model="filters.has_people" @change="doSearch()">
             <option value="">All</option>
             <option value="yes">With People</option>
             <option value="no">No People</option>
@@ -3124,11 +2894,11 @@ HTML_TEMPLATE = r"""
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;">
         <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;white-space:nowrap">Search in:</span>
         <div class="pill-row" style="margin:0;flex:1;flex-wrap:nowrap;overflow-x:auto">
-          <span class="pill" :class="{active:searchDb===''}" @click="searchDb='';doSearch(true)" style="white-space:nowrap">
+          <span class="pill" :class="{active:searchDb===''}" @click="searchDb='';doSearch()" style="white-space:nowrap">
             🗄 Main Archive
           </span>
           <template x-for="db in projectDbs" :key="db.path">
-            <span class="pill" :class="{active:searchDb===db.path}" @click="searchDb=db.path;doSearch(true)"
+            <span class="pill" :class="{active:searchDb===db.path}" @click="searchDb=db.path;doSearch()"
               style="white-space:nowrap" :title="db.path">
               📁 <span x-text="db.name.replace('.db','')"></span>
               <span style="opacity:.6;font-size:10px;margin-left:3px" x-text="'('+db.count+')'"></span>
@@ -3139,18 +2909,18 @@ HTML_TEMPLATE = r"""
       </div>
 
       <div style="display:flex;gap:8px;margin-bottom:10px">
-        <input type="text" x-model="searchQuery" placeholder="golden hour boat, drone aerial, old lady smiling…" @keydown.enter="doSearch(true)" style="flex:1" />
-        <button class="btn btn-primary" @click="doSearch(true)">Search</button>
+        <input type="text" x-model="searchQuery" placeholder="golden hour boat, drone aerial, old lady smiling…" @keydown.enter="doSearch()" style="flex:1" />
+        <button class="btn btn-primary" @click="doSearch()">Search</button>
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
         <div class="pill-row">
-          <span class="pill" :class="{active:searchType===''}" @click="searchType='';doSearch(true)">All</span>
-          <span class="pill" :class="{active:searchType==='video'}" @click="searchType='video';doSearch(true)">Videos</span>
-          <span class="pill" :class="{active:searchType==='image'}" @click="searchType='image';doSearch(true)">Images</span>
+          <span class="pill" :class="{active:searchType===''}" @click="searchType='';doSearch()">All</span>
+          <span class="pill" :class="{active:searchType==='video'}" @click="searchType='video';doSearch()">Videos</span>
+          <span class="pill" :class="{active:searchType==='image'}" @click="searchType='image';doSearch()">Images</span>
         </div>
         <div class="pill-row" style="gap:4px;">
-          <span class="pill" :class="{active:!smartSearch}" @click="smartSearch=false;doSearch(true)" style="font-size:11px;">🔍 Exact</span>
-          <span class="pill" :class="{active:smartSearch}" @click="smartSearch=true;doSearch(true)" style="font-size:11px;">✦ Smart</span>
+          <span class="pill" :class="{active:!smartSearch}" @click="smartSearch=false;doSearch()" style="font-size:11px;">🔍 Exact</span>
+          <span class="pill" :class="{active:smartSearch}" @click="smartSearch=true;doSearch()" style="font-size:11px;">✦ Smart</span>
         </div>
       </div>
       <!-- Smart search expansion info -->
@@ -3177,25 +2947,9 @@ HTML_TEMPLATE = r"""
         <div class="empty-text">No results for "<span x-text="searchQuery"></span>"</div>
       </div>
 
-      <!-- Results summary + pagination controls + duplicate toggle -->
-      <div x-show="searchResults.length" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--muted);margin-bottom:12px">
-        <div>
-          <span x-text="totalResults"></span> result<span x-show="totalResults!==1">s</span>
-          <span x-show="searchQuery"> for "<span x-text="searchQuery" style="color:var(--text)"></span>"</span>
-          <span x-show="totalPages > 1"> · Page <span x-text="currentPage"></span> of <span x-text="totalPages"></span></span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <!-- Hide duplicates toggle -->
-          <label style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none" title="Group clips that are ~90% visually similar">
-            <input type="checkbox" x-model="hideDupes" @change="doSearch(true)" style="accent-color:var(--accent)">
-            <span>Hide duplicates</span>
-          </label>
-          <!-- Per-page selector -->
-          <span style="margin-left:6px">Show</span>
-          <template x-for="n in [25, 50, 100]" :key="n">
-            <span class="pill" :class="{active: perPage===n}" @click="setPerPage(n)" x-text="n" style="cursor:pointer;padding:2px 8px;font-size:11px"></span>
-          </template>
-        </div>
+      <div x-show="searchResults.length" style="font-size:11px;color:var(--muted);margin-bottom:12px">
+        <span x-text="searchResults.length"></span> result<span x-show="searchResults.length!==1">s</span>
+        <span x-show="searchQuery"> for "<span x-text="searchQuery" style="color:var(--text)"></span>"</span>
       </div>
 
       <div class="result-grid">
@@ -3252,23 +3006,9 @@ HTML_TEMPLATE = r"""
               <button class="result-btn" title="Open in Premiere Pro" @click.stop="openInPremiere(r.file_path)">🎬</button>
               <button class="result-btn" :title="settings.send_folder ? 'Send to ' + settings.send_folder : 'Set a destination folder above first'" :style="!settings.send_folder ? 'opacity:.45;cursor:not-allowed' : ''" @click.stop="settings.send_folder ? sendToFolder(r.file_path, r) : null">→ Send</button>
             </div>
-            <!-- Duplicate badge -->
-            <div x-show="r.duplicate_count > 0" style="margin-top:6px;font-size:11px;color:var(--accent);cursor:pointer" @click.stop="expandDuplicates(r)">
-              +<span x-text="r.duplicate_count"></span> similar clip<span x-show="r.duplicate_count!==1">s</span> · click to view
-            </div>
             <div class="result-toast" x-show="r._toast" x-text="r._toast" style="font-size:11px;color:var(--success);margin-top:6px"></div>
           </div>
         </template>
-      </div>
-
-      <!-- Pagination nav -->
-      <div x-show="totalPages > 1" style="display:flex;align-items:center;justify-content:center;gap:6px;margin-top:16px;padding-bottom:20px">
-        <button class="btn btn-ghost" style="padding:4px 10px;font-size:12px" :disabled="currentPage<=1" @click="goToPage(currentPage-1)">← Prev</button>
-        <template x-for="p in pageNumbers()" :key="'pg'+p">
-          <button x-show="p > 0" class="btn btn-ghost" style="padding:4px 10px;font-size:12px;min-width:32px" :class="{'btn-primary': p === currentPage}" @click="goToPage(p)" x-text="p"></button>
-          <span x-show="p === 0" style="color:var(--muted);font-size:12px">…</span>
-        </template>
-        <button class="btn btn-ghost" style="padding:4px 10px;font-size:12px" :disabled="currentPage>=totalPages" @click="goToPage(currentPage+1)">Next →</button>
       </div>
     </div>
   </div>
@@ -3634,6 +3374,16 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
             <option value="ollama">Ollama (local, free)</option>
           </select>
         </div>
+        <div class="form-row">
+          <label>Secondary Provider (Failover)</label>
+          <select x-model="settings.secondary_vision_provider">
+            <option value="">None — no failover</option>
+            <option value="gemini">Gemini 2.5 Flash</option>
+            <option value="openai">GPT-4o Vision</option>
+            <option value="ollama">Ollama (Local)</option>
+          </select>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">If the primary API fails on a clip, this provider takes over automatically</div>
+        </div>
         <div class="form-row-inline">
           <div class="form-row">
             <label>Gemini Model</label>
@@ -3703,6 +3453,13 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
           <div class="form-row">
             <label>Max Scenes / Clip</label>
             <input type="text" x-model="settings.max_scenes_per_clip" placeholder="8" />
+          </div>
+        </div>
+        <div class="form-row-inline">
+          <div class="form-row">
+            <label>Max Workers (Parallel Processing)</label>
+            <input type="number" x-model.number="settings.max_workers" placeholder="4" min="1" max="8" />
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Number of clips processed simultaneously (1-8). Higher = faster, but uses more API quota.</div>
           </div>
         </div>
         <div class="form-row">
@@ -3859,24 +3616,6 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
       </div>
 
       <button class="btn btn-primary" @click="saveSettings()">Save Settings</button>
-
-      <div class="settings-section" style="margin-top:24px">
-        <div class="settings-section-title">Duplicate Detection</div>
-        <div class="form-row">
-          <label>Backfill Perceptual Hashes</label>
-          <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-            Compute visual fingerprints for all already-tagged clips so the "Hide duplicates" toggle works in Search.
-            New clips tagged after this update will have hashes computed automatically.
-          </div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn btn-ghost" @click="backfillPhash()" :disabled="phashBackfilling">
-              <span x-show="!phashBackfilling">🔍 Compute Hashes</span>
-              <span x-show="phashBackfilling">Computing…</span>
-            </button>
-            <span x-show="phashBackfillResult" style="font-size:11px;color:var(--success)" x-text="phashBackfillResult"></span>
-          </div>
-        </div>
-      </div>
     </div>
   </div>
 
@@ -3898,10 +3637,6 @@ function app() {
     activeJobId: null,
     jobStatus: '',
     logLines: [],
-    liveClips: [],
-    liveClipCount: 0,
-    jobStartedAt: '',
-    _liveTimer: null,
     folderHistory: JSON.parse(localStorage.getItem('mnFolderHistory') || '[]'),
 
     // Search
@@ -3912,15 +3647,6 @@ function app() {
     searchResults: [],
     searchLoading: false,
     searchError: '',
-    // Pagination
-    currentPage: 1,
-    perPage: 50,
-    totalResults: 0,
-    totalPages: 1,
-    // Duplicate grouping
-    hideDupes: false,
-    phashBackfilling: false,
-    phashBackfillResult: '',
 
     // Filters and search enhancements
     filterOptions: {},
@@ -4033,7 +3759,6 @@ function app() {
 
     async startTag() {
       this.tagError = '';
-      this.stopLiveClipPoll();
       const folder = this.tagFolder.trim();
       if (!folder) return;
       if (!this.saveToMain && !this.projectDbName.trim()) {
@@ -4047,10 +3772,10 @@ function app() {
         body: JSON.stringify({
           folder,
           reprocess:      this.tagReprocess,
-          custom_tags: this.customTags.trim(),
           save_to_main:   this.saveToMain,
           project_db:     this.projectDbName.trim(),
           project_folder: this.projectDbFolder.trim(),
+          custom_tags:    this.customTags.trim(),
         })
       });
       const d = await r.json();
@@ -4063,11 +3788,7 @@ function app() {
       this.activeJobId = d.job_id;
       this.jobStatus   = 'running';
       this.logLines    = [];
-      this.liveClips   = [];
-      this.liveClipCount = 0;
-      this.jobStartedAt = new Date().toISOString().replace('T',' ').slice(0,19);
       this.streamLog(d.job_id);
-      this.startLiveClipPoll();
       // Refresh project DB list after job completes
       setTimeout(() => this.loadProjectDbs(), 3000);
     },
@@ -4081,8 +3802,6 @@ function app() {
           if (d.__done__) {
             this.jobStatus = d.status;
             es.close();
-            this.stopLiveClipPoll();
-            this.fetchLiveClips();
             this.loadStats();
             return;
           }
@@ -4108,38 +3827,7 @@ function app() {
       this.activeJobId = null;
       this.jobStatus   = '';
       this.logLines    = [];
-      this.liveClips   = [];
-      this.liveClipCount = 0;
       this.tagError    = '';
-    },
-
-    // ── Live clip polling ────────────────────────────────────────────
-    startLiveClipPoll() {
-      this.stopLiveClipPoll();
-      this._liveTimer = setInterval(() => this.fetchLiveClips(), 8000);
-    },
-    stopLiveClipPoll() {
-      if (this._liveTimer) { clearInterval(this._liveTimer); this._liveTimer = null; }
-    },
-    async fetchLiveClips() {
-      if (!this.jobStartedAt) return;
-      try {
-        const r = await fetch('/api/recent-tagged?since=' + encodeURIComponent(this.jobStartedAt) + '&limit=50');
-        const clips = await r.json();
-        if (Array.isArray(clips)) {
-          this.liveClips = clips;
-          this.liveClipCount = clips.length;
-          for (const c of clips) {
-            if (!c._thumbs) {
-              try {
-                const tr = await fetch('/api/file-thumbnails?path=' + encodeURIComponent(c.file_path));
-                const td = await tr.json();
-                c._thumbs = td.thumbnails || [];
-              } catch(e) { c._thumbs = []; }
-            }
-          }
-        }
-      } catch(e) {}
     },
 
     logClass(line) {
@@ -4153,8 +3841,7 @@ function app() {
       return '';
     },
 
-    async doSearch(resetPage) {
-      if (resetPage) this.currentPage = 1;
+    async doSearch() {
       this.searchLoading = true;
       this.searchError   = '';
       this.expandedInfo  = '';
@@ -4176,85 +3863,18 @@ function app() {
         if (this.filters.file_type)        params.append('type',             this.filters.file_type);
         if (this.filters.fps)              params.append('fps',              this.filters.fps);
         if (this.filters.has_people)       params.append('has_people',       this.filters.has_people);
-        params.append('page', this.currentPage);
-        params.append('per_page', this.perPage);
-        if (this.hideDupes) params.append('hide_dupes', 'true');
         if (this.searchDb) params.append('db', this.searchDb);
         const r = await fetch('/api/search?' + params);
         const d = await r.json();
-        if (d.error) { this.searchError = d.error; this.searchResults = []; this.totalResults = 0; this.totalPages = 1; }
-        else {
-          this.searchResults = d.results || [];
-          this.totalResults  = d.total || 0;
-          this.totalPages    = d.total_pages || 1;
-          this.currentPage   = d.page || 1;
+        if (d.error) { this.searchError = d.error; this.searchResults = []; }
+        else if (d.results) {
+          // Smart search returns {results, expanded, original}
+          this.searchResults = d.results;
           this.expandedInfo  = d.expanded || '';
         }
+        else this.searchResults = d;
       } catch(e) { this.searchError = 'Search failed'; }
       this.searchLoading = false;
-    },
-
-    goToPage(p) {
-      if (p < 1 || p > this.totalPages || p === this.currentPage) return;
-      this.currentPage = p;
-      this.doSearch(false);
-      window.scrollTo({top: 0, behavior: 'smooth'});
-    },
-
-    setPerPage(n) {
-      this.perPage = n;
-      this.currentPage = 1;
-      this.doSearch(false);
-    },
-
-    pageNumbers() {
-      var pages = [];
-      var s = Math.max(1, this.currentPage - 2);
-      var e = Math.min(this.totalPages, this.currentPage + 2);
-      if (s > 1) { pages.push(1); if (s > 2) pages.push(0); }
-      for (var i = s; i <= e; i++) pages.push(i);
-      if (e < this.totalPages) { if (e < this.totalPages - 1) pages.push(0); pages.push(this.totalPages); }
-      return pages;
-    },
-
-    async backfillPhash() {
-      this.phashBackfilling = true;
-      this.phashBackfillResult = '';
-      try {
-        const params = new URLSearchParams();
-        if (this.searchDb) params.append('db', this.searchDb);
-        const r = await fetch('/api/backfill-phash?' + params, {method: 'POST'});
-        const d = await r.json();
-        if (d.error) { this.phashBackfillResult = 'Error: ' + d.error; }
-        else { this.phashBackfillResult = `Done — ${d.updated} hashed, ${d.errors} skipped, ${d.total} total`; }
-      } catch(e) { this.phashBackfillResult = 'Failed to run backfill'; }
-      this.phashBackfilling = false;
-    },
-
-    async expandDuplicates(item) {
-      if (!item.phash) return;
-      if (item._dupesExpanded) {
-        // Toggle off: remove duplicates from results
-        const dupePaths = new Set((item.duplicates || []).map(d => d.file_path));
-        this.searchResults = this.searchResults.filter(r => !dupePaths.has(r.file_path));
-        item._dupesExpanded = false;
-        return;
-      }
-      try {
-        const params = new URLSearchParams({phash: item.phash});
-        if (this.searchDb) params.append('db', this.searchDb);
-        const res = await fetch('/api/similar?' + params);
-        const dupes = await res.json();
-        if (Array.isArray(dupes) && dupes.length > 1) {
-          // Insert duplicates right after this item in the results array
-          const idx = this.searchResults.indexOf(item);
-          const newDupes = dupes.filter(function(d){ return d.file_path !== item.file_path; })
-                                .map(function(d){ return Object.assign({}, d, {_isDuplicate: true, _parentPath: item.file_path}); });
-          item.duplicates = newDupes;
-          item._dupesExpanded = true;
-          this.searchResults.splice(idx + 1, 0, ...newDupes);
-        }
-      } catch(e) { console.error('Failed to load similar clips', e); }
     },
 
 
@@ -4374,12 +3994,12 @@ function app() {
 
     clearFilters() {
       this.filters = {camera: '', shot_type: '', setting: '', mood: '', lighting: '', file_ext: '', file_type: '', fps: '', has_people: ''};
-      this.doSearch(true);
+      this.doSearch();
     },
 
     async loadRecent() {
       this.searchQuery = '';
-      await this.doSearch(true);
+      await this.doSearch();
     },
 
     async analyseScript() {

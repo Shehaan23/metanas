@@ -1,7 +1,7 @@
 {
-  "version": "14.1.1",
+  "version": "14.2.0",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
   "download_url": "https://github.com/Shehaan23/metanas/releases",
-  "release_notes": "Windows support, phash duplicate detection, database stability fixes (WAL mode), dependency auto-install.",
+  "release_notes": "Self-updater fix, database sync fix for fresh installs, NAS timeout improvements.",
   "required": false
 }

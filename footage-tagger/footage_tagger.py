@@ -62,12 +62,6 @@ try:
 except Exception:
     GEMINI_AVAILABLE = False
 
-try:
-    import imagehash
-    IMAGEHASH_AVAILABLE = True
-except ImportError:
-    IMAGEHASH_AVAILABLE = False
-
 # ── Cost tracker (Gemini 2.5 Flash pricing Apr 2026) ─────────────────────────
 # $0.15 / 1M input tokens, $0.60 / 1M output tokens
 # Each frame call ≈ 1 200 input tokens (image + prompt) + 400 output tokens
@@ -454,7 +448,7 @@ def get_tech_meta(file_path):
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", str(file_path)],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=120)
         data = json.loads(result.stdout)
         fmt = data.get("format", {})
         streams = data.get("streams", [])
@@ -510,7 +504,7 @@ def extract_arw_preview(arw_path, output_path):
         try:
             result = subprocess.run(
                 ["exiftool", tag, "-b", str(arw_path)],
-                capture_output=True, timeout=30)
+                capture_output=True, timeout=120)
             if result.returncode == 0 and len(result.stdout) > 1000:
                 output_path.write_bytes(result.stdout)
                 return True
@@ -538,22 +532,6 @@ def transcribe_audio(file_path, config):
         return ""
 
 
-# ── Perceptual hashing ───────────────────────────────────────────────────────
-
-def _compute_phash(image_path):
-    """Compute a 64-bit perceptual hash and return as hex string (16 chars).
-    Returns None if imagehash or PIL is unavailable."""
-    if not IMAGEHASH_AVAILABLE:
-        return None
-    try:
-        img = PIL.Image.open(image_path)
-        h = imagehash.phash(img)
-        return str(h)  # hex string e.g. 'a1b2c3d4e5f6a7b8'
-    except Exception as e:
-        log.warning(f"  Could not compute phash: {e}")
-        return None
-
-
 # ── Scene detection & keyframe extraction ────────────────────────────────────
 
 def extract_keyframes(file_path, config, tmp_dir):
@@ -573,7 +551,7 @@ def extract_keyframes(file_path, config, tmp_dir):
                 subprocess.run(
                     ["ffmpeg", "-y", "-ss", str(start.get_seconds()), "-i", str(file_path),
                      "-frames:v", "1", "-q:v", "2", str(out)],
-                    capture_output=True, timeout=30)
+                    capture_output=True, timeout=120)
                 if out.exists():
                     frames.append(str(out))
         except Exception as e:
@@ -586,7 +564,7 @@ def extract_keyframes(file_path, config, tmp_dir):
             subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(ts), "-i", str(file_path),
                  "-frames:v", "1", "-q:v", "2", str(out)],
-                capture_output=True, timeout=30)
+                capture_output=True, timeout=120)
             if out.exists():
                 frames.append(str(out))
                 log.info("  1 scene(s) detected (fallback)")
@@ -787,7 +765,7 @@ def embed_metadata_in_image(media_path, metadata):
     cmd.append(str(media_path))
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             log.info(f"  ✓ Metadata embedded into: {media_path.name}")
         else:
@@ -799,9 +777,7 @@ def embed_metadata_in_image(media_path, metadata):
 # ── SQLite database ───────────────────────────────────────────────────────────
 
 def init_db(db_path):
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS media_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -813,7 +789,6 @@ def init_db(db_path):
             color_palette TEXT, mood_tags TEXT,
             tags TEXT, persons TEXT, transcription TEXT,
             vision_provider TEXT,
-            phash TEXT,
             processed_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -830,12 +805,6 @@ def init_db(db_path):
         END
     """)
     conn.commit()
-    # Migrate: add phash column if missing (for DBs created before v14.1)
-    cursor = conn.execute("PRAGMA table_info(media_files)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "phash" not in columns:
-        conn.execute("ALTER TABLE media_files ADD COLUMN phash TEXT")
-        conn.commit()
     return conn
 
 
@@ -845,12 +814,12 @@ def upsert_db(conn, data):
             (file_path,file_type,camera_model,duration,fps,description,shot_type,
              subjects,setting,lighting,motion,mood,
              camera_movement,time_of_day,audio_type,color_palette,mood_tags,
-             tags,persons,transcription,vision_provider,phash)
+             tags,persons,transcription,vision_provider)
         VALUES
             (:file_path,:file_type,:camera_model,:duration,:fps,:description,:shot_type,
              :subjects,:setting,:lighting,:motion,:mood,
              :camera_movement,:time_of_day,:audio_type,:color_palette,:mood_tags,
-             :tags,:persons,:transcription,:vision_provider,:phash)
+             :tags,:persons,:transcription,:vision_provider)
         ON CONFLICT(file_path) DO UPDATE SET
             camera_model=excluded.camera_model, duration=excluded.duration,
             fps=excluded.fps, description=excluded.description,
@@ -866,7 +835,6 @@ def upsert_db(conn, data):
             tags=excluded.tags,
             persons=excluded.persons, transcription=excluded.transcription,
             vision_provider=excluded.vision_provider,
-            phash=excluded.phash,
             processed_at=datetime('now')
     """, data)
     conn.commit()
@@ -943,12 +911,8 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
                 log.info(f"  ✓ {len(frames)} thumbnail(s) saved for preview")
             except Exception as e:
                 log.warning(f"  Could not save thumbnails: {e}")
-
-            # ── Compute perceptual hash from first keyframe ──
-            phash_hex = _compute_phash(frames[0])
         else:
             log.warning("  No keyframes extracted")
-            phash_hex = None
 
     persons = safe_str_list(ai_meta.get("identified_persons", []))
     if persons:
@@ -1014,7 +978,6 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
         "tags": json.dumps(metadata["tags"]),
         "persons": json.dumps(persons),
         "transcription": transcription, "vision_provider": provider_used,
-        "phash": phash_hex,
     })
 
 
@@ -1031,14 +994,12 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
     provider = config.get("vision_provider", "ollama")
     provider_used = provider
 
-    phash_hex = None
     if file_path.suffix.lower() == ".arw":
         with tempfile.TemporaryDirectory() as tmp:
             preview = Path(tmp) / (file_path.stem + "_preview.jpg")
             if extract_arw_preview(file_path, preview):
                 log.info("  ARW preview extracted")
                 ai_meta, provider_used = analyse_frame_with_failover(str(preview), config, reference_persons)
-                phash_hex = _compute_phash(str(preview))
                 # Save ARW preview as thumbnail for UI
                 try:
                     metanas_home = Path.home() / ".metanas"
@@ -1054,7 +1015,6 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
                 ai_meta = {}
     else:
         ai_meta, provider_used = analyse_frame_with_failover(str(file_path), config, reference_persons)
-        phash_hex = _compute_phash(str(file_path))
         # For standard images (jpg/png), create a thumbnail copy for the UI
         try:
             metanas_home = Path.home() / ".metanas"
@@ -1134,7 +1094,6 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
         "mood_tags": json.dumps(metadata["mood_tags"]),
         "tags": json.dumps(metadata["tags"]), "persons": json.dumps(persons),
         "transcription": "", "vision_provider": provider_used,
-        "phash": phash_hex,
     })
 
 
@@ -1247,9 +1206,7 @@ def main():
     def process_file_wrapper(file_type, file_index, total_index, file_path):
         """Wrapper to process a single file and track progress."""
         # Each thread gets its own DB connection for thread safety
-        thread_conn = sqlite3.connect(config["db_path"], timeout=30)
-        thread_conn.execute("PRAGMA journal_mode=WAL")
-        thread_conn.execute("PRAGMA busy_timeout=10000")
+        thread_conn = sqlite3.connect(config["db_path"])
         skip, _ = already_processed(thread_conn, file_path)
         log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
         try:
@@ -1290,9 +1247,7 @@ def main():
         log.info(f"\n── Retrying {len(failed_files)} failed file(s)… ──────────────────────────")
         for ft, fi, ti, fp in failed_files:
             log.info(f"  Retry: {fp.name}")
-            retry_conn = sqlite3.connect(config["db_path"], timeout=30)
-            retry_conn.execute("PRAGMA journal_mode=WAL")
-            retry_conn.execute("PRAGMA busy_timeout=10000")
+            retry_conn = sqlite3.connect(config["db_path"])
             try:
                 if ft == "Video":
                     process_video(fp, config, retry_conn, reference_persons, args.reprocess)
