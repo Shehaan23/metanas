@@ -8,6 +8,15 @@ Usage:
     Open: http://localhost:5151
 """
 
+# ── Patch 2.2: Force UTF-8 stdout/stderr (Windows cp1252 crashes on Unicode) ──
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import os
 import platform
@@ -735,9 +744,15 @@ def start_tag():
                 _venv_bin = str(METANAS_HOME / ".venv" / "Scripts")
                 # On Windows, inherit the current env and prepend venv + tools
                 _subprocess_env = os.environ.copy()
-                # Prepend venv Scripts and bundled tools directory
-                _tools_dir = str(BASE_DIR / "tools")
-                _subprocess_env["PATH"] = _venv_bin + ";" + _tools_dir + ";" + _subprocess_env.get("PATH", "")
+                # Patch 2.9: Look in METANAS_HOME/tools first (where install_tools.bat
+                # downloads to, since Program Files is read-only). Fall back to
+                # BASE_DIR/tools for bundled-tools builds.
+                _tools_dir_user = str(METANAS_HOME / "tools")
+                _tools_dir_bundle = str(BASE_DIR / "tools")
+                _subprocess_env["PATH"] = (
+                    _venv_bin + ";" + _tools_dir_user + ";" + _tools_dir_bundle
+                    + ";" + _subprocess_env.get("PATH", "")
+                )
                 _subprocess_env["PYTHONUNBUFFERED"] = "1"
                 # Remove PYTHONHOME/PYTHONPATH if set (interferes with venv)
                 _subprocess_env.pop("PYTHONHOME", None)
