@@ -1,1 +1,7 @@
-{"version": "14.2.0"}
+{
+  "version": "14.2.2",
+  "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.2.2",
+  "release_notes": "v14.2.2 Bug Fixes\n\n• Gemini 2.0 Flash as default (2.5 Flash deprecated)\n• Switchable Gemini model in Settings (2.0, 2.0 Lite, 2.5 legacy, 3.8)\n• Fixed audio transcription for Python 3.14 (ffmpeg extraction fallback)\n• Improved keyframe extraction — 3 frames at 25/50/75% for short clips\n• Mac system tools installer — one-click Homebrew install for ffmpeg/exiftool\n• DB resilience and thread-safety improvements",
+  "required": false
+}
