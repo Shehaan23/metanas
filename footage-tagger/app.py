@@ -100,7 +100,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.2.2"
+APP_VERSION = "14.2.3"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
