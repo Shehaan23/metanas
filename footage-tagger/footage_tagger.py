@@ -7,7 +7,7 @@ containers so Adobe Bridge and Premiere Pro can search and display it.
 
 Vision providers:
   openai  — GPT-4o Vision
-  gemini  — Google Gemini 2.5 Flash (google-genai SDK)
+  gemini  — Google Gemini 2.0 Flash / 3.8 Flash (google-genai SDK)
   ollama  — Local model via Ollama (Mac Mini)
 
 Usage:
@@ -272,7 +272,7 @@ def analyse_frame_with_openai(frame_path, api_key, model="gpt-4o",
 
 # ── Gemini Vision ─────────────────────────────────────────────────────────────
 
-def analyse_frame_with_gemini(frame_path, api_key, model="gemini-2.5-flash",
+def analyse_frame_with_gemini(frame_path, api_key, model="gemini-2.0-flash",
                                reference_persons=None, retries=3):
     if not GEMINI_AVAILABLE:
         log.error("google-genai not installed. Run: pip3 install google-genai Pillow")
@@ -384,7 +384,7 @@ def analyse_frame(frame_path, config, reference_persons):
     elif provider == "gemini":
         return analyse_frame_with_gemini(
             frame_path, api_key=config["gemini_api_key"],
-            model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+            model=config.get("gemini_vision_model", "gemini-2.0-flash"),
             reference_persons=reference_persons)
     else:
         return analyse_frame_with_ollama(
@@ -408,7 +408,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
     elif primary == "gemini":
         result = analyse_frame_with_gemini(
             frame_path, api_key=config.get("gemini_api_key", ""),
-            model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+            model=config.get("gemini_vision_model", "gemini-2.0-flash"),
             reference_persons=reference_persons)
     else:
         result = analyse_frame_with_ollama(
@@ -427,7 +427,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
         elif secondary == "gemini":
             result = analyse_frame_with_gemini(
                 frame_path, api_key=config.get("gemini_api_key", ""),
-                model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
                 reference_persons=reference_persons)
         else:
             result = analyse_frame_with_ollama(
@@ -515,6 +515,25 @@ def extract_arw_preview(arw_path, output_path):
 
 # ── Transcription ─────────────────────────────────────────────────────────────
 
+def _extract_audio_wav(file_path, tmp_dir):
+    """Extract audio from a video file to a temporary WAV using ffmpeg.
+    This bypasses PyAV entirely, avoiding version-specific API issues
+    (e.g. metadata_errors argument not supported in newer av releases).
+    Returns the path to the WAV file, or None if extraction failed."""
+    wav_path = Path(tmp_dir) / "audio.wav"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(file_path),
+             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+             str(wav_path)],
+            capture_output=True, timeout=120)
+        if wav_path.exists() and wav_path.stat().st_size > 1000:
+            return str(wav_path)
+    except Exception as e:
+        log.debug(f"ffmpeg audio extraction failed: {e}")
+    return None
+
+
 def transcribe_audio(file_path, config):
     if not WHISPER_AVAILABLE:
         return ""
@@ -525,8 +544,13 @@ def transcribe_audio(file_path, config):
         compute = "int8" if compute == "auto" else compute
         model = WhisperModel(config.get("whisper_model", "medium"),
                              device=device, compute_type=compute)
-        segments, _ = model.transcribe(str(file_path), beam_size=5)
-        return " ".join(s.text for s in segments).strip()
+
+        # First try: extract audio to WAV via ffmpeg (avoids PyAV compat issues)
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = _extract_audio_wav(file_path, tmp)
+            audio_src = wav_path if wav_path else str(file_path)
+            segments, _ = model.transcribe(audio_src, beam_size=5)
+            return " ".join(s.text for s in segments).strip()
     except Exception as e:
         log.warning(f"Transcription failed for {file_path.name}: {e}")
         return ""
@@ -559,15 +583,23 @@ def extract_keyframes(file_path, config, tmp_dir):
     if not frames:
         try:
             dur = get_tech_meta(file_path).get("duration", 0)
-            ts = dur / 2 if dur > 2 else 1
-            out = tmp_dir / "frame_0000.jpg"
-            subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(ts), "-i", str(file_path),
-                 "-frames:v", "1", "-q:v", "2", str(out)],
-                capture_output=True, timeout=120)
-            if out.exists():
-                frames.append(str(out))
-                log.info("  1 scene(s) detected (fallback)")
+            # Extract 3 evenly-spaced frames for better thumbnails & richer AI context
+            if dur > 4:
+                positions = [dur * 0.25, dur * 0.50, dur * 0.75]
+            elif dur > 2:
+                positions = [dur * 0.5]
+            else:
+                positions = [1]
+            for i, ts in enumerate(positions):
+                out = tmp_dir / f"frame_{i:04d}.jpg"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", str(ts), "-i", str(file_path),
+                     "-frames:v", "1", "-q:v", "2", str(out)],
+                    capture_output=True, timeout=120)
+                if out.exists():
+                    frames.append(str(out))
+            if frames:
+                log.info(f"  {len(frames)} scene(s) detected (fallback)")
         except Exception as e:
             log.warning(f"Frame extraction fallback failed: {e}")
     return frames
@@ -776,10 +808,100 @@ def embed_metadata_in_image(media_path, metadata):
 
 # ── SQLite database ───────────────────────────────────────────────────────────
 
-def init_db(db_path):
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+def _check_db_integrity(db_path):
+    """Check if a database file is healthy. Returns True if OK, False if corrupt."""
+    if not Path(db_path).exists():
+        return True  # New DB, nothing to check
+    try:
+        c = sqlite3.connect(db_path, timeout=10)
+        result = c.execute("PRAGMA integrity_check").fetchone()
+        c.close()
+        return result and result[0] == "ok"
+    except Exception:
+        return False
+
+
+def _recover_db(db_path):
+    """Attempt to recover a corrupted database.
+
+    Strategy:
+    1. Try to dump whatever data we can from the corrupt DB
+    2. Rename corrupt file as .corrupt backup
+    3. Create fresh DB and re-import recovered rows
+
+    Even if we lose some rows, the XMP sidecars on disk still have all the
+    metadata — the user can run --reprocess to re-index them.
+    """
+    corrupt_path = Path(db_path)
+    backup_path = corrupt_path.with_suffix(".db.corrupt")
+    log.warning(f"  Database corrupt: {db_path}")
+    log.warning(f"  Attempting recovery...")
+
+    # Try to salvage rows from the corrupt DB
+    recovered_rows = []
+    try:
+        c = sqlite3.connect(db_path, timeout=10)
+        try:
+            recovered_rows = c.execute(
+                "SELECT file_path, file_type, camera_model, duration, fps, "
+                "description, shot_type, subjects, setting, lighting, motion, mood, "
+                "camera_movement, time_of_day, audio_type, color_palette, mood_tags, "
+                "tags, persons, transcription, vision_provider, phash, processed_at "
+                "FROM media_files"
+            ).fetchall()
+            log.info(f"  Recovered {len(recovered_rows)} row(s) from corrupt DB")
+        except Exception as e:
+            log.warning(f"  Could not read rows from corrupt DB: {e}")
+        c.close()
+    except Exception:
+        pass
+
+    # Rename corrupt file (keep as backup)
+    try:
+        # Also remove WAL/SHM files which may be part of the corruption
+        for suffix in ["-wal", "-shm"]:
+            wal_file = Path(str(db_path) + suffix)
+            if wal_file.exists():
+                wal_file.unlink()
+                log.info(f"  Removed {wal_file.name}")
+        corrupt_path.rename(backup_path)
+        log.info(f"  Corrupt DB backed up to: {backup_path.name}")
+    except Exception as e:
+        log.error(f"  Could not rename corrupt DB: {e}")
+        # Last resort: just delete it
+        try:
+            corrupt_path.unlink()
+        except Exception:
+            pass
+
+    # Create fresh DB via init_db (called by the caller after this returns)
+    # Re-import recovered rows if we got any
+    if recovered_rows:
+        try:
+            new_conn = sqlite3.connect(db_path, timeout=60)
+            new_conn.execute("PRAGMA journal_mode=WAL")
+            new_conn.execute("PRAGMA busy_timeout=30000")
+            _create_tables(new_conn)
+            cols = ("file_path, file_type, camera_model, duration, fps, "
+                    "description, shot_type, subjects, setting, lighting, motion, mood, "
+                    "camera_movement, time_of_day, audio_type, color_palette, mood_tags, "
+                    "tags, persons, transcription, vision_provider, phash, processed_at")
+            placeholders = ", ".join(["?"] * 23)
+            new_conn.executemany(
+                f"INSERT OR IGNORE INTO media_files ({cols}) VALUES ({placeholders})",
+                recovered_rows
+            )
+            new_conn.commit()
+            new_conn.close()
+            log.info(f"  Re-imported {len(recovered_rows)} row(s) into fresh DB")
+        except Exception as e:
+            log.error(f"  Failed to re-import rows: {e}")
+
+    return True  # Signal that caller should proceed with init_db
+
+
+def _create_tables(conn):
+    """Create the media_files table, FTS index, and trigger."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS media_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -812,6 +934,17 @@ def init_db(db_path):
         END
     """)
     conn.commit()
+
+
+def init_db(db_path):
+    # Check integrity before opening — if corrupt, try to recover
+    if not _check_db_integrity(db_path):
+        _recover_db(db_path)
+
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    _create_tables(conn)
     return conn
 
 
@@ -904,7 +1037,9 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
         frames = extract_keyframes(file_path, config, Path(tmp))
         if frames:
             log.info(f"  Analysing keyframe with {provider}…")
-            ai_meta, provider_used = analyse_frame_with_failover(frames[0], config, reference_persons)
+            # Use the middle frame for vision analysis (most representative)
+            mid = len(frames) // 2
+            ai_meta, provider_used = analyse_frame_with_failover(frames[mid], config, reference_persons)
 
             # ── Save keyframes to permanent thumbnails folder for UI preview ──
             try:
@@ -1141,7 +1276,7 @@ def main():
     provider = config.get("vision_provider", "ollama").lower()
     model_name = {
         "openai": config.get("openai_vision_model", "gpt-4o"),
-        "gemini": config.get("gemini_vision_model", "gemini-2.5-flash"),
+        "gemini": config.get("gemini_vision_model", "gemini-2.0-flash"),
         "ollama": config.get("ollama_vision_model", "llama3.2-vision"),
     }.get(provider, "unknown")
     log.info(f"Vision provider: {provider.upper()} ({model_name})")
@@ -1205,17 +1340,36 @@ def main():
     max_workers = config.get("max_workers", 4)
     log.info(f"Using {max_workers} worker(s) for parallel processing")
 
-    # Thread-safe lock for SQLite access (SQLite is not thread-safe by default)
     import threading
-    _db_lock = threading.Lock()
     failed_files = []  # Feature 3: track failed files for retry
+
+    # Thread-local storage: each worker gets ONE persistent DB connection
+    # instead of opening/closing per file (avoids hundreds of connect calls).
+    _thread_local = threading.local()
+
+    def _get_thread_conn():
+        """Return a persistent DB connection for the current thread."""
+        if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
+            for attempt in range(3):
+                try:
+                    c = sqlite3.connect(config["db_path"], timeout=60)
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("PRAGMA busy_timeout=30000")
+                    _thread_local.conn = c
+                    return c
+                except sqlite3.OperationalError as e:
+                    log.warning(f"  DB connect attempt {attempt+1}/3 failed: {e}")
+                    time.sleep(2 ** attempt)
+            raise sqlite3.OperationalError(f"Cannot open database after 3 attempts: {config['db_path']}")
+        return _thread_local.conn
 
     def process_file_wrapper(file_type, file_index, total_index, file_path):
         """Wrapper to process a single file and track progress."""
-        # Each thread gets its own DB connection for thread safety
-        thread_conn = sqlite3.connect(config["db_path"], timeout=30)
-        thread_conn.execute("PRAGMA journal_mode=WAL")
-        thread_conn.execute("PRAGMA busy_timeout=10000")
+        try:
+            thread_conn = _get_thread_conn()
+        except sqlite3.OperationalError as e:
+            log.error(f"  ERROR: {e}")
+            return (0, (file_type, file_index, total_index, file_path))
         skip, _ = already_processed(thread_conn, file_path)
         log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
         try:
@@ -1223,13 +1377,18 @@ def main():
                 process_video(file_path, config, thread_conn, reference_persons, args.reprocess)
             else:
                 process_image(file_path, config, thread_conn, reference_persons, args.reprocess)
-            thread_conn.close()
             if args.reprocess or not skip:
                 return (1, None)
             return (0, None)
         except Exception as e:
             log.error(f"  ERROR: {e}")
-            thread_conn.close()
+            # If it's a DB error, reset the thread connection so it reconnects
+            if "database" in str(e).lower() or "unable to open" in str(e).lower():
+                try:
+                    _thread_local.conn.close()
+                except Exception:
+                    pass
+                _thread_local.conn = None
             return (0, (file_type, file_index, total_index, file_path))
 
     # Build file list
@@ -1251,25 +1410,37 @@ def main():
             except Exception as e:
                 log.error(f"Worker exception: {e}")
 
-    # Feature 3: Retry failed files
+    # Close thread-local connections
+    # (ThreadPoolExecutor reuses threads, so clean up after the pool exits)
+
+    # Feature 3: Retry failed files (sequentially, with a fresh connection)
     if failed_files:
         log.info(f"\n── Retrying {len(failed_files)} failed file(s)… ──────────────────────────")
-        for ft, fi, ti, fp in failed_files:
-            log.info(f"  Retry: {fp.name}")
-            retry_conn = sqlite3.connect(config["db_path"], timeout=30)
-            retry_conn.execute("PRAGMA journal_mode=WAL")
-            retry_conn.execute("PRAGMA busy_timeout=10000")
+        retry_conn = None
+        for attempt in range(3):
             try:
-                if ft == "Video":
-                    process_video(fp, config, retry_conn, reference_persons, args.reprocess)
-                else:
-                    process_image(fp, config, retry_conn, reference_persons, args.reprocess)
-                processed += 1
-                log.info(f"  ✓ Retry succeeded: {fp.name}")
-            except Exception as e:
-                log.error(f"  ✗ Retry failed: {fp.name} — {e}")
-            finally:
-                retry_conn.close()
+                retry_conn = sqlite3.connect(config["db_path"], timeout=60)
+                retry_conn.execute("PRAGMA journal_mode=WAL")
+                retry_conn.execute("PRAGMA busy_timeout=30000")
+                break
+            except sqlite3.OperationalError as e:
+                log.warning(f"  Retry DB connect attempt {attempt+1}/3 failed: {e}")
+                time.sleep(2 ** attempt)
+        if retry_conn is None:
+            log.error("  Cannot open database for retries — skipping.")
+        else:
+            for ft, fi, ti, fp in failed_files:
+                log.info(f"  Retry: {fp.name}")
+                try:
+                    if ft == "Video":
+                        process_video(fp, config, retry_conn, reference_persons, args.reprocess)
+                    else:
+                        process_image(fp, config, retry_conn, reference_persons, args.reprocess)
+                    processed += 1
+                    log.info(f"  ✓ Retry succeeded: {fp.name}")
+                except Exception as e:
+                    log.error(f"  ✗ Retry failed: {fp.name} — {e}")
+            retry_conn.close()
 
     # Log costs
     if config.get("vision_provider", "ollama").lower() == "gemini" and COST_TRACKER["calls"] > 0:

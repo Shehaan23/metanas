@@ -347,7 +347,7 @@ def load_config():
         "openai_api_key": "",
         "openai_vision_model": "gpt-4o",
         "gemini_api_key": "",
-        "gemini_vision_model": "gemini-2.5-flash",
+        "gemini_vision_model": "gemini-2.0-flash",
         "ollama_url": "http://localhost:11434",
         "ollama_vision_model": "llama3.2-vision",
         "whisper_model": "medium",
@@ -629,6 +629,60 @@ def stats():
     except Exception as e:
         return jsonify({"error": str(e), "total": 0, "videos": 0, "images": 0,
                         "db_exists": True, "nas_ok": nas_ok})
+
+
+@app.route("/api/system-tools")
+def system_tools():
+    """Check which system-level CLI tools are installed (Mac only)."""
+    tools = {}
+    for name in ("ffmpeg", "ffprobe", "exiftool"):
+        try:
+            result = subprocess.run(
+                ["which", name], capture_output=True, text=True, timeout=5)
+            tools[name] = result.returncode == 0
+        except Exception:
+            tools[name] = False
+    # On Windows, tools are auto-installed by install_tools.bat — skip the check
+    if IS_WINDOWS:
+        tools = {k: True for k in tools}
+    # Check if Homebrew is available (needed for install suggestions on Mac)
+    brew_ok = False
+    if not IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["which", "brew"], capture_output=True, text=True, timeout=5)
+            brew_ok = result.returncode == 0
+        except Exception:
+            pass
+    tools["brew_available"] = brew_ok
+    return jsonify(tools)
+
+
+@app.route("/api/install-tools", methods=["POST"])
+def install_tools():
+    """Install missing system tools via Homebrew (Mac only).
+    Runs 'brew install <tool>' and returns the result."""
+    if IS_WINDOWS:
+        return jsonify({"error": "Use install_tools.bat on Windows"}), 400
+    requested = request.json or {}
+    tool_name = requested.get("tool", "")
+    allowed = {"ffmpeg", "exiftool"}
+    if tool_name not in allowed:
+        return jsonify({"error": f"Unknown tool: {tool_name}"}), 400
+    try:
+        result = subprocess.run(
+            ["brew", "install", tool_name],
+            capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            return jsonify({"ok": True, "output": result.stdout[-500:]})
+        else:
+            return jsonify({"ok": False,
+                            "error": result.stderr[-500:] or result.stdout[-500:]})
+    except FileNotFoundError:
+        return jsonify({"ok": False,
+                        "error": "Homebrew not found. Install it from https://brew.sh"}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/tag", methods=["POST"])
@@ -1014,7 +1068,7 @@ def _expand_query(user_query: str, config: dict) -> str:
             from google import genai as _genai
             _client = _genai.Client(api_key=api_key)
             resp = _client.models.generate_content(
-                model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
                 contents=EXPAND_PROMPT
             )
             raw = resp.text.strip()
@@ -1505,7 +1559,7 @@ def script_source():
             from google import genai as _genai
             _client = _genai.Client(api_key=api_key)
             resp = _client.models.generate_content(
-                model=config.get("gemini_vision_model", "gemini-2.5-flash"),
+                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
                 contents=PROMPT + script_text
             )
             raw  = resp.text.strip()
@@ -2575,6 +2629,36 @@ HTML_TEMPLATE = r"""
       <div class="view-sub">Overview of your tagged archive</div>
     </div>
     <div class="view-body">
+
+      <!-- Missing tools banner -->
+      <template x-if="missingTools.length > 0">
+        <div style="background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.3);border-radius:8px;padding:16px 20px;margin-bottom:20px;">
+          <div style="font-weight:600;font-size:13px;color:var(--accent);margin-bottom:8px;">System Tools Missing</div>
+          <div style="font-size:12px;color:var(--text);line-height:1.6;margin-bottom:12px;">
+            The following tools are not installed. Tagging will still work but some features will be limited:
+          </div>
+          <template x-for="tool in missingTools" :key="tool">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;padding:8px 12px;background:var(--surface2);border-radius:6px;">
+              <span style="font-size:13px;font-weight:500;min-width:80px" x-text="tool"></span>
+              <span style="font-size:11px;color:var(--muted);flex:1" x-text="tool==='exiftool' ? 'Needed to embed metadata into video/image files' : 'Needed for video frame extraction and audio processing'"></span>
+              <template x-if="brewAvailable">
+                <button class="btn btn-sm" style="white-space:nowrap"
+                  :disabled="toolInstalling===tool"
+                  @click="installTool(tool)"
+                  x-text="toolInstalling===tool ? 'Installing...' : 'Install with Homebrew'">
+                </button>
+              </template>
+              <template x-if="!brewAvailable">
+                <span style="font-size:11px;color:var(--warn);">Run: brew install <span x-text="tool"></span></span>
+              </template>
+            </div>
+          </template>
+          <div x-show="!brewAvailable" style="font-size:11px;color:var(--muted);margin-top:8px;">
+            Homebrew not found. Install it from <a href="https://brew.sh" target="_blank" style="color:var(--accent)">brew.sh</a>, then restart METANAS.
+          </div>
+        </div>
+      </template>
+
       <div class="card-grid" style="margin-bottom:24px">
         <div class="stat-card">
           <div class="stat-num" x-text="stats.total ?? '—'"></div>
@@ -2651,7 +2735,7 @@ HTML_TEMPLATE = r"""
             <div class="form-row">
               <label>Vision Provider</label>
               <select x-model="tagProvider" @change="updateProviderInConfig()">
-                <option value="gemini">Gemini 2.5 Flash</option>
+                <option value="gemini">Google Gemini</option>
                 <option value="openai">GPT-4o Vision</option>
                 <option value="ollama">Ollama (Local)</option>
               </select>
@@ -2734,7 +2818,7 @@ HTML_TEMPLATE = r"""
             <li>Saves everything to the searchable database</li>
           </ol>
           <div class="divider"></div>
-          <div style="color:var(--accent);font-weight:600">Gemini 2.5 Flash ≈ $0.01–0.05 per project</div>
+          <div style="color:var(--accent);font-weight:600">Gemini 2.0 Flash ≈ $0.01–0.05 per project</div>
         </div>
       </div>
 
@@ -3384,7 +3468,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
         <div class="form-row">
           <label>Default Provider</label>
           <select x-model="settings.vision_provider">
-            <option value="gemini">Gemini 2.5 Flash (recommended)</option>
+            <option value="gemini">Google Gemini (recommended)</option>
             <option value="openai">GPT-4o Vision</option>
             <option value="ollama">Ollama (local, free)</option>
           </select>
@@ -3393,7 +3477,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
           <label>Secondary Provider (Failover)</label>
           <select x-model="settings.secondary_vision_provider">
             <option value="">None — no failover</option>
-            <option value="gemini">Gemini 2.5 Flash</option>
+            <option value="gemini">Google Gemini</option>
             <option value="openai">GPT-4o Vision</option>
             <option value="ollama">Ollama (Local)</option>
           </select>
@@ -3402,7 +3486,13 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
         <div class="form-row-inline">
           <div class="form-row">
             <label>Gemini Model</label>
-            <input type="text" x-model="settings.gemini_vision_model" placeholder="gemini-2.5-flash" />
+            <select x-model="settings.gemini_vision_model">
+              <option value="gemini-2.0-flash">Gemini 2.0 Flash (recommended)</option>
+              <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (cheapest)</option>
+              <option value="gemini-2.5-flash">Gemini 2.5 Flash (legacy)</option>
+              <option value="gemini-3.8-flash">Gemini 3.8 Flash (latest)</option>
+            </select>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">2.0 Flash is stable and cost-effective. 3.8 Flash is Google's newest model.</div>
           </div>
           <div class="form-row">
             <label>OpenAI Model</label>
@@ -3642,6 +3732,9 @@ function app() {
     view: 'dashboard',
     stats: {},
     nasOk: false,
+    missingTools: [],
+    brewAvailable: false,
+    toolInstalling: '',
 
     // Tag
     tagFolder: '',
@@ -3716,6 +3809,7 @@ function app() {
       await this.loadStats();
       await this.loadProjectDbs();
       this.checkDbExists();
+      await this.checkSystemTools();
     },
 
 
@@ -3726,6 +3820,38 @@ function app() {
         this.stats = d;
         this.nasOk = d.nas_ok;
       } catch(e) {}
+    },
+
+    async checkSystemTools() {
+      try {
+        const r = await fetch('/api/system-tools');
+        const d = await r.json();
+        this.brewAvailable = d.brew_available || false;
+        const missing = [];
+        if (!d.ffmpeg)   missing.push('ffmpeg');
+        if (!d.exiftool) missing.push('exiftool');
+        this.missingTools = missing;
+      } catch(e) { this.missingTools = []; }
+    },
+
+    async installTool(name) {
+      this.toolInstalling = name;
+      try {
+        const r = await fetch('/api/install-tools', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({tool: name})
+        });
+        const d = await r.json();
+        if (d.ok) {
+          this.missingTools = this.missingTools.filter(t => t !== name);
+        } else {
+          alert('Install failed: ' + (d.error || 'Unknown error'));
+        }
+      } catch(e) {
+        alert('Install failed: ' + e.message);
+      }
+      this.toolInstalling = '';
     },
 
     async loadSettings() {
