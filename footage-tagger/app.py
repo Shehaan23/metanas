@@ -48,6 +48,16 @@ BASE_DIR      = Path(__file__).parent
 # ── and avoids macOS app-bundle write-protection (authorization denied).
 METANAS_HOME  = Path.home() / ".metanas"
 METANAS_HOME.mkdir(parents=True, exist_ok=True)
+
+# ── Shadow-update: if a newer app.py was downloaded to ~/.metanas/updates/,
+# ── re-exec from there so the updated code runs even when the .app bundle
+# ── is read-only (DMG, signed, or /Volumes mount).
+_UPDATES_DIR = METANAS_HOME / "updates"
+_SHADOW_APP  = _UPDATES_DIR / "app.py"
+if _SHADOW_APP.exists() and not os.environ.get("METANAS_SHADOW"):
+    os.environ["METANAS_SHADOW"] = "1"
+    os.execv(sys.executable, [sys.executable, str(_SHADOW_APP)] + sys.argv[1:])
+
 CONFIG_PATH   = METANAS_HOME / "config.yaml"
 HISTORY_PATH  = METANAS_HOME / "job_history.json"
 
@@ -708,7 +718,9 @@ def start_tag():
         "reprocess": reprocess,
     }
 
-    script = BASE_DIR / "footage_tagger.py"
+    # Prefer shadow-updated tagger if present (from auto-updater)
+    _shadow_tagger = METANAS_HOME / "updates" / "footage_tagger.py"
+    script = _shadow_tagger if _shadow_tagger.exists() else BASE_DIR / "footage_tagger.py"
     # Use the venv Python explicitly — sys.executable can resolve incorrectly
     # when Flask is launched from a macOS app bundle context.
     if IS_WINDOWS:
@@ -1785,10 +1797,20 @@ def apply_update():
         with open(tmp_app, "wb") as f:
             f.write(new_code)
 
+        bundle_writable = False
         for target in [bundle_root / "app.py", bundle_root.parent / "app.py"]:
             if target.exists():
-                shutil.copy2(str(tmp_app), str(target))
-                replaced.append(str(target))
+                try:
+                    shutil.copy2(str(tmp_app), str(target))
+                    replaced.append(str(target))
+                    bundle_writable = True
+                except (PermissionError, OSError):
+                    pass
+        if not bundle_writable:
+            updates_dir = METANAS_HOME / "updates"
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(tmp_app), str(updates_dir / "app.py"))
+            replaced.append(str(updates_dir / "app.py"))
         tmp_app.unlink(missing_ok=True)
 
         # 2. Download and replace footage_tagger.py too
@@ -1803,9 +1825,19 @@ def apply_update():
                 with open(tmp_tagger, "wb") as f:
                     f.write(tagger_code)
                 tagger_target = bundle_root / "footage_tagger.py"
+                tagger_copied = False
                 if tagger_target.exists():
-                    shutil.copy2(str(tmp_tagger), str(tagger_target))
-                    replaced.append(str(tagger_target))
+                    try:
+                        shutil.copy2(str(tmp_tagger), str(tagger_target))
+                        replaced.append(str(tagger_target))
+                        tagger_copied = True
+                    except (PermissionError, OSError):
+                        pass
+                if not tagger_copied:
+                    updates_dir = METANAS_HOME / "updates"
+                    updates_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(tmp_tagger), str(updates_dir / "footage_tagger.py"))
+                    replaced.append(str(updates_dir / "footage_tagger.py"))
                 tmp_tagger.unlink(missing_ok=True)
         except Exception:
             pass  # tagger update is best-effort — app.py update is the critical one
