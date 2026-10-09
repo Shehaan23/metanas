@@ -110,7 +110,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.2.5"
+APP_VERSION = "14.3"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -1181,8 +1181,8 @@ def search_api():
             sql += f" AND ({p}persons IS NULL OR {p}persons = \'[]\' OR {p}persons = \'\'"
         return sql, params
 
-    SEL  = "file_path,file_type,camera_model,description,shot_type,persons,tags,setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,audio_type,color_palette,mood_tags"
-    MSEL = "m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags"
+    SEL  = "file_path,file_type,camera_model,description,shot_type,persons,tags,setting,lighting,mood,fps,processed_at,camera_movement,time_of_day,audio_type,color_palette,mood_tags,transcription"
+    MSEL = "m.file_path,m.file_type,m.camera_model,m.description,m.shot_type,m.persons,m.tags,m.setting,m.lighting,m.mood,m.fps,m.processed_at,m.camera_movement,m.time_of_day,m.audio_type,m.color_palette,m.mood_tags,m.transcription"
 
     # ── Smart search: expand query with AI synonyms ─────────────────
     expanded_query = None
@@ -1223,6 +1223,7 @@ def search_api():
                 "audio_type":      r[14] or "",
                 "color_palette":   r[15] or "",
                 "mood_tags":       json.loads(r[16] or "[]"),
+                "transcription":   r[17] or "",
                 "filename":        Path(r[0]).name,
                 "folder":          Path(r[0]).parent.name,
             })
@@ -2572,6 +2573,21 @@ HTML_TEMPLATE = r"""
   .result-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(249,115,22,.08); }
   .result-btn:last-child { margin-left: auto; font-weight: 600; }
 
+  /* Transcript toggle & panel */
+  .transcript-toggle { display:flex; align-items:center; gap:6px; margin-top:10px; padding:6px 10px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:11px; color:var(--muted); transition:all .15s; width:100%; }
+  .transcript-toggle:hover { border-color:var(--accent); color:var(--accent); }
+  .transcript-toggle.open { border-radius:6px 6px 0 0; border-color:var(--accent); color:var(--accent); }
+  .transcript-toggle .t-arrow { transition:transform .2s; font-size:9px; }
+  .transcript-toggle.open .t-arrow { transform:rotate(180deg); }
+  .transcript-toggle .t-label { flex:1; text-align:left; }
+  .transcript-toggle.disabled { opacity:.45; cursor:default; }
+  .transcript-toggle.disabled:hover { border-color:var(--border); color:var(--muted); }
+  .transcript-panel { max-height:0; overflow:hidden; transition:max-height .25s ease; }
+  .transcript-panel.open { max-height:180px; }
+  .transcript-content { padding:10px 12px; background:var(--surface2); border:1px solid var(--accent); border-top:0; border-radius:0 0 6px 6px; font-size:11px; line-height:1.7; color:#a3a3a3; max-height:140px; overflow-y:auto; }
+  .transcript-content mark { background:rgba(249,115,22,.25); color:var(--accent); padding:1px 3px; border-radius:3px; font-weight:600; }
+  .transcript-match-count { display:inline-block; background:rgba(249,115,22,.15); color:var(--accent); padding:1px 6px; border-radius:3px; font-size:10px; font-weight:500; margin-top:4px; }
+
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -3132,6 +3148,28 @@ HTML_TEMPLATE = r"""
                 <span class="tag" style="background:var(--accent-dim,rgba(255,140,0,.15));color:var(--accent)" x-text="t"></span>
               </template>
             </div>
+            <!-- Transcript toggle -->
+            <template x-if="r.transcription">
+              <div>
+                <button class="transcript-toggle" :class="{'open': r._txOpen}" @click.stop="r._txOpen = !r._txOpen">
+                  <span>🎙</span>
+                  <span class="t-label">Transcript</span>
+                  <span class="t-arrow">▼</span>
+                </button>
+                <div class="transcript-panel" :class="{'open': r._txOpen}">
+                  <div class="transcript-content" x-html="highlightTranscript(r.transcription, searchQuery)"></div>
+                  <template x-if="searchQuery && countMatches(r.transcription, searchQuery) > 0">
+                    <span class="transcript-match-count" x-text="countMatches(r.transcription, searchQuery) + ' match' + (countMatches(r.transcription, searchQuery) !== 1 ? 'es' : '')"></span>
+                  </template>
+                </div>
+              </div>
+            </template>
+            <template x-if="!r.transcription">
+              <button class="transcript-toggle disabled" disabled>
+                <span>🎙</span>
+                <span class="t-label">No audio transcript</span>
+              </button>
+            </template>
             <div class="result-actions">
               <button class="result-btn" title="Reveal in File Manager" @click.stop="revealFile(r.file_path)">📂</button>
               <button class="result-btn" title="Open in Premiere Pro" @click.stop="openInPremiere(r.file_path)">🎬</button>
@@ -4042,10 +4080,10 @@ function app() {
         if (d.error) { this.searchError = d.error; this.searchResults = []; }
         else if (d.results) {
           // Smart search returns {results, expanded, original}
-          this.searchResults = d.results;
+          this.searchResults = d.results.map(r => ({...r, _txOpen: false}));
           this.expandedInfo  = d.expanded || '';
         }
-        else this.searchResults = d;
+        else this.searchResults = (Array.isArray(d) ? d : []).map(r => ({...r, _txOpen: false}));
       } catch(e) { this.searchError = 'Search failed'; }
       this.searchLoading = false;
     },
@@ -4236,6 +4274,27 @@ function app() {
     async loadHistory() {
       const r = await fetch('/api/history');
       this.historyRows = await r.json();
+    },
+
+    /* ── Transcript helpers ────────────────────────── */
+    highlightTranscript(text, query) {
+      if (!text) return '';
+      if (!query) return text.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const escaped = text.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      // Split search query into individual terms
+      const terms = query.split(/\s+OR\s+|,\s*|\s+/).filter(t => t.length > 1);
+      if (!terms.length) return escaped;
+      const pattern = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+      const re = new RegExp('(' + pattern + ')', 'gi');
+      return escaped.replace(re, '<mark>$1</mark>');
+    },
+    countMatches(text, query) {
+      if (!text || !query) return 0;
+      const terms = query.split(/\s+OR\s+|,\s*|\s+/).filter(t => t.length > 1);
+      if (!terms.length) return 0;
+      const pattern = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+      const re = new RegExp(pattern, 'gi');
+      return (text.match(re) || []).length;
     },
 
     async revealFile(fp) {

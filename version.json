@@ -1,7 +1,7 @@
 {
-  "version": "14.2.5",
+  "version": "14.3",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.2.5",
-  "release_notes": "v14.2.5\n\n• Gemini 2.0 Flash deprecated by Google — default changed to 3.8 Flash\n• Fixed transcription for .app bundles (ffmpeg path + numpy WAV loading)\n• Fixed auto-updater for read-only app bundles (shadow update)",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3",
+  "release_notes": "v14.3\n\n• New: Expandable transcript viewer on search result cards\n• Search term highlighting within transcriptions\n• Match count badge shows how many hits per clip",
   "required": false
 }
