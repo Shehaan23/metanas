@@ -355,18 +355,26 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
         if ref_path and Path(ref_path).exists():
             images.append(encode_image_b64(ref_path))
     images.append(encode_image_b64(frame_path))
-    payload = {"model": model, "prompt": prompt, "images": images,
-               "stream": False, "options": {"temperature": 0.2}}
+    base = ollama_url.rstrip("/")
+    # Use /api/chat (works with qwen3-vl, llava, llama3.2-vision, etc.)
+    chat_payload = {
+        "model": model, "stream": False,
+        "options": {"temperature": 0.2},
+        "messages": [{"role": "user", "content": prompt,
+                      "images": images}],
+    }
     for attempt in range(retries):
         try:
-            resp = requests.post(f"{ollama_url.rstrip('/')}/api/generate",
-                                 json=payload, timeout=120)
+            resp = requests.post(f"{base}/api/chat",
+                                 json=chat_payload, timeout=180)
             resp.raise_for_status()
-            return json.loads(clean_json(resp.json().get("response", "")))
+            body = resp.json()
+            text = body.get("message", {}).get("content", "")
+            return json.loads(clean_json(text))
         except json.JSONDecodeError as e:
-            log.warning(f"Ollama JSON parse error (attempt {attempt+1}/3): {e}")
+            log.warning(f"Ollama JSON parse error (attempt {attempt+1}/{retries}): {e}")
         except Exception as e:
-            log.warning(f"Ollama attempt {attempt+1}/3 failed: {e}")
+            log.warning(f"Ollama attempt {attempt+1}/{retries} failed: {e}")
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
     return {}
