@@ -272,7 +272,7 @@ def analyse_frame_with_openai(frame_path, api_key, model="gpt-4o",
 
 # ── Gemini Vision ─────────────────────────────────────────────────────────────
 
-def analyse_frame_with_gemini(frame_path, api_key, model="gemini-2.0-flash",
+def analyse_frame_with_gemini(frame_path, api_key, model="gemini-3.8-flash",
                                reference_persons=None, retries=3):
     if not GEMINI_AVAILABLE:
         log.error("google-genai not installed. Run: pip3 install google-genai Pillow")
@@ -384,7 +384,7 @@ def analyse_frame(frame_path, config, reference_persons):
     elif provider == "gemini":
         return analyse_frame_with_gemini(
             frame_path, api_key=config["gemini_api_key"],
-            model=config.get("gemini_vision_model", "gemini-2.0-flash"),
+            model=config.get("gemini_vision_model", "gemini-3.8-flash"),
             reference_persons=reference_persons)
     else:
         return analyse_frame_with_ollama(
@@ -408,7 +408,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
     elif primary == "gemini":
         result = analyse_frame_with_gemini(
             frame_path, api_key=config.get("gemini_api_key", ""),
-            model=config.get("gemini_vision_model", "gemini-2.0-flash"),
+            model=config.get("gemini_vision_model", "gemini-3.8-flash"),
             reference_persons=reference_persons)
     else:
         result = analyse_frame_with_ollama(
@@ -427,7 +427,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
         elif secondary == "gemini":
             result = analyse_frame_with_gemini(
                 frame_path, api_key=config.get("gemini_api_key", ""),
-                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
+                model=config.get("gemini_vision_model", "gemini-3.8-flash"),
                 reference_persons=reference_persons)
         else:
             result = analyse_frame_with_ollama(
@@ -1289,7 +1289,7 @@ def main():
     provider = config.get("vision_provider", "ollama").lower()
     model_name = {
         "openai": config.get("openai_vision_model", "gpt-4o"),
-        "gemini": config.get("gemini_vision_model", "gemini-2.0-flash"),
+        "gemini": config.get("gemini_vision_model", "gemini-3.8-flash"),
         "ollama": config.get("ollama_vision_model", "llama3.2-vision"),
     }.get(provider, "unknown")
     log.info(f"Vision provider: {provider.upper()} ({model_name})")

@@ -110,7 +110,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.2.4"
+APP_VERSION = "14.2.5"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -357,7 +357,7 @@ def load_config():
         "openai_api_key": "",
         "openai_vision_model": "gpt-4o",
         "gemini_api_key": "",
-        "gemini_vision_model": "gemini-2.0-flash",
+        "gemini_vision_model": "gemini-3.8-flash",
         "ollama_url": "http://localhost:11434",
         "ollama_vision_model": "llama3.2-vision",
         "whisper_model": "medium",
@@ -1080,7 +1080,7 @@ def _expand_query(user_query: str, config: dict) -> str:
             from google import genai as _genai
             _client = _genai.Client(api_key=api_key)
             resp = _client.models.generate_content(
-                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
+                model=config.get("gemini_vision_model", "gemini-3.8-flash"),
                 contents=EXPAND_PROMPT
             )
             raw = resp.text.strip()
@@ -1571,7 +1571,7 @@ def script_source():
             from google import genai as _genai
             _client = _genai.Client(api_key=api_key)
             resp = _client.models.generate_content(
-                model=config.get("gemini_vision_model", "gemini-2.0-flash"),
+                model=config.get("gemini_vision_model", "gemini-3.8-flash"),
                 contents=PROMPT + script_text
             )
             raw  = resp.text.strip()
@@ -3519,7 +3519,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
           <div class="form-row">
             <label>Gemini Model</label>
             <select x-model="settings.gemini_vision_model">
-              <option value="gemini-2.0-flash">Gemini 2.0 Flash (recommended)</option>
+              <option value="gemini-3.8-flash">Gemini 2.0 Flash (recommended)</option>
               <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (cheapest)</option>
               <option value="gemini-2.5-flash">Gemini 2.5 Flash (legacy)</option>
               <option value="gemini-3.8-flash">Gemini 3.8 Flash (latest)</option>
