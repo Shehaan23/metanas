@@ -522,8 +522,13 @@ def _extract_audio_wav(file_path, tmp_dir):
     Returns the path to the WAV file, or None if extraction failed."""
     wav_path = Path(tmp_dir) / "audio.wav"
     try:
+        # Resolve ffmpeg — .app bundles don't inherit shell PATH
+        import shutil as _sh
+        _ffmpeg = _sh.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+        if not Path(_ffmpeg).exists():
+            _ffmpeg = "/usr/local/bin/ffmpeg"
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(file_path),
+            [_ffmpeg, "-y", "-i", str(file_path),
              "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
              str(wav_path)],
             capture_output=True, timeout=120)
@@ -548,8 +553,16 @@ def transcribe_audio(file_path, config):
         # First try: extract audio to WAV via ffmpeg (avoids PyAV compat issues)
         with tempfile.TemporaryDirectory() as tmp:
             wav_path = _extract_audio_wav(file_path, tmp)
-            audio_src = wav_path if wav_path else str(file_path)
-            segments, _ = model.transcribe(audio_src, beam_size=5)
+            if wav_path:
+                # Load WAV as numpy array — bypasses av.open() which breaks on Python 3.14
+                import wave as _wave
+                import numpy as _np
+                with _wave.open(wav_path) as wf:
+                    audio = _np.frombuffer(wf.readframes(wf.getnframes()),
+                                           dtype=_np.int16).astype(_np.float32) / 32768.0
+                segments, _ = model.transcribe(audio, beam_size=5)
+            else:
+                segments, _ = model.transcribe(str(file_path), beam_size=5)
             return " ".join(s.text for s in segments).strip()
     except Exception as e:
         log.warning(f"Transcription failed for {file_path.name}: {e}")
