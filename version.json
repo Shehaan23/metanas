@@ -1,7 +1,7 @@
 {
-  "version": "14.3.1",
+  "version": "14.3.2",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.1",
-  "release_notes": "v14.3.1\n\n• Fixed Ollama: use /api/chat endpoint for qwen3-vl compatibility\n• Added Ollama model selector to Settings UI\n• Increased vision timeout to 180s for local models",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.2",
+  "release_notes": "v14.3.2\n\n• Fixed Qwen3 thinking mode corrupting JSON — added /no_think prefix\n• Improved clean_json to strip <think> blocks and extract JSON from noisy output",
   "required": false
 }

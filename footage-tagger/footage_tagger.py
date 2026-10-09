@@ -186,8 +186,19 @@ def encode_image_b64(image_path: str) -> str:
 
 def clean_json(raw: str) -> str:
     raw = raw.strip()
+    # Strip <think>...</think> blocks (Qwen3 reasoning output)
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # Strip markdown code fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    # Extract first JSON object if surrounded by other text
+    match = re.search(r"\{", raw)
+    if match and match.start() > 0:
+        raw = raw[match.start():]
+    # Remove trailing text after the last closing brace
+    last_brace = raw.rfind("}")
+    if last_brace >= 0:
+        raw = raw[:last_brace + 1]
     return raw.strip()
 
 
@@ -357,10 +368,14 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     images.append(encode_image_b64(frame_path))
     base = ollama_url.rstrip("/")
     # Use /api/chat (works with qwen3-vl, llava, llama3.2-vision, etc.)
+    # Prepend /no_think for Qwen3 models to disable chain-of-thought
+    effective_prompt = prompt
+    if "qwen3" in model.lower():
+        effective_prompt = "/no_think\n" + prompt
     chat_payload = {
         "model": model, "stream": False,
         "options": {"temperature": 0.2},
-        "messages": [{"role": "user", "content": prompt,
+        "messages": [{"role": "user", "content": effective_prompt,
                       "images": images}],
     }
     for attempt in range(retries):
