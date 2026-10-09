@@ -38,7 +38,8 @@ echo "  ╚═══════════════════════
 echo ""
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BUILD_DIR="$REPO_DIR/build"
+# Build in /tmp to avoid iCloud Desktop sync adding resource forks
+BUILD_DIR="/tmp/metanas_build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -67,17 +68,39 @@ for candidate in \
   fi
 done
 
-if [ -n "$ICON_SOURCE" ]; then
-  # Copy .icns file
-  cp "$ICON_SOURCE/METANAS.icns" "$RESOURCES/"
-  # Copy .png if it exists
-  [ -f "$ICON_SOURCE/METANAS.png" ] && cp "$ICON_SOURCE/METANAS.png" "$RESOURCES/"
-  # Copy iconset folder if it exists
-  [ -d "$ICON_SOURCE/METANAS.iconset" ] && cp -R "$ICON_SOURCE/METANAS.iconset" "$RESOURCES/"
-  echo "  ✓ Icons copied from $(dirname "$ICON_SOURCE")"
+# Find the source PNG and rebuild .icns fresh (avoids resource-fork contamination)
+PNG_SOURCE=""
+for candidate in \
+  "/Applications/$APP_NAME.app/Contents/Resources/METANAS.png" \
+  "$HOME/Desktop/build_fresh/$APP_NAME.app/Contents/Resources/METANAS.png" \
+  "$HOME/Downloads/03 — METANAS/Builds/$APP_NAME.app/Contents/Resources/METANAS.png"; do
+  if [ -f "$candidate" ]; then
+    PNG_SOURCE="$candidate"
+    break
+  fi
+done
+
+if [ -n "$PNG_SOURCE" ]; then
+  # Copy the PNG (strip resource forks)
+  cat "$PNG_SOURCE" > "$RESOURCES/METANAS.png"
+  # Build a fresh iconset from the PNG
+  ICONSET="$RESOURCES/METANAS.iconset"
+  mkdir -p "$ICONSET"
+  sips -z 16 16     "$RESOURCES/METANAS.png" --out "$ICONSET/icon_16x16.png"      >/dev/null
+  sips -z 32 32     "$RESOURCES/METANAS.png" --out "$ICONSET/icon_16x16@2x.png"   >/dev/null
+  sips -z 32 32     "$RESOURCES/METANAS.png" --out "$ICONSET/icon_32x32.png"      >/dev/null
+  sips -z 64 64     "$RESOURCES/METANAS.png" --out "$ICONSET/icon_32x32@2x.png"   >/dev/null
+  sips -z 128 128   "$RESOURCES/METANAS.png" --out "$ICONSET/icon_128x128.png"    >/dev/null
+  sips -z 256 256   "$RESOURCES/METANAS.png" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+  sips -z 256 256   "$RESOURCES/METANAS.png" --out "$ICONSET/icon_256x256.png"    >/dev/null
+  sips -z 512 512   "$RESOURCES/METANAS.png" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+  sips -z 512 512   "$RESOURCES/METANAS.png" --out "$ICONSET/icon_512x512.png"    >/dev/null
+  sips -z 1024 1024 "$RESOURCES/METANAS.png" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+  iconutil -c icns "$ICONSET" -o "$RESOURCES/METANAS.icns"
+  rm -rf "$ICONSET"
+  echo "  ✓ Icon rebuilt fresh from PNG"
 else
-  echo "  ⚠ No existing METANAS.icns found — app will use default macOS icon"
-  echo "    Place METANAS.icns in $RESOURCES/ and re-run if you want a custom icon"
+  echo "  ⚠ No METANAS.png found — app will use default macOS icon"
 fi
 
 # ── 2. Copy application code ───────────────────────────────────────────────
@@ -254,6 +277,12 @@ echo "  ✓ Launcher written"
 # ── 5. Code sign ────────────────────────────────────────────────────────────
 echo "  🔏 Signing with: $SIGN_IDENTITY"
 
+# Strip any extended attributes / resource forks before signing
+find "$APP_DIR" -exec xattr -c {} \; 2>/dev/null
+dot_clean "$APP_DIR" 2>/dev/null
+find "$APP_DIR" -name '._*' -delete 2>/dev/null
+find "$APP_DIR" -name '.DS_Store' -delete 2>/dev/null
+
 codesign --deep --force --options runtime \
   --sign "$SIGN_IDENTITY" \
   --timestamp \
@@ -319,6 +348,10 @@ echo "  ║                                          ║"
 echo "  ║   DMG: build/$DMG_NAME"
 echo "  ║   Version: $VERSION                        ║"
 echo "  ╚══════════════════════════════════════════╝"
+# Copy DMG to repo build/ folder for easy access
+mkdir -p "$REPO_DIR/build"
+cp "$DMG_PATH" "$REPO_DIR/build/"
+echo "  📁 DMG also copied to: $REPO_DIR/build/$DMG_NAME"
 echo ""
-echo "  Upload $DMG_PATH to Gumroad."
+echo "  Upload to Gumroad: $REPO_DIR/build/$DMG_NAME"
 echo ""

@@ -110,7 +110,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.3.3"
+APP_VERSION = "14.3.4"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -644,11 +644,18 @@ def stats():
 @app.route("/api/system-tools")
 def system_tools():
     """Check which system-level CLI tools are installed (Mac only)."""
+    # Build a PATH that includes Homebrew locations — when launched from an
+    # .app bundle the default PATH is minimal and won't find brew-installed tools.
+    check_env = os.environ.copy()
+    if not IS_WINDOWS:
+        extra = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
+        check_env["PATH"] = extra + ":" + check_env.get("PATH", "/usr/bin:/bin")
     tools = {}
     for name in ("ffmpeg", "ffprobe", "exiftool"):
         try:
             result = subprocess.run(
-                ["which", name], capture_output=True, text=True, timeout=5)
+                ["which", name], capture_output=True, text=True, timeout=5,
+                env=check_env)
             tools[name] = result.returncode == 0
         except Exception:
             tools[name] = False
@@ -660,7 +667,8 @@ def system_tools():
     if not IS_WINDOWS:
         try:
             result = subprocess.run(
-                ["which", "brew"], capture_output=True, text=True, timeout=5)
+                ["which", "brew"], capture_output=True, text=True, timeout=5,
+                env=check_env)
             brew_ok = result.returncode == 0
         except Exception:
             pass
