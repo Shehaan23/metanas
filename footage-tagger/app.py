@@ -3557,17 +3557,21 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
           <div class="form-row">
             <label>Gemini Model</label>
             <select x-model="settings.gemini_vision_model">
-              <option value="gemini-3.8-flash">Gemini 2.0 Flash (recommended)</option>
+              <option value="gemini-3.8-flash">Gemini 3.8 Flash (latest)</option>
               <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (cheapest)</option>
               <option value="gemini-2.5-flash">Gemini 2.5 Flash (legacy)</option>
-              <option value="gemini-3.8-flash">Gemini 3.8 Flash (latest)</option>
             </select>
-            <div style="font-size:11px;color:var(--muted);margin-top:4px">2.0 Flash is stable and cost-effective. 3.8 Flash is Google's newest model.</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">3.8 Flash is Google's newest model.</div>
           </div>
           <div class="form-row">
             <label>OpenAI Model</label>
             <input type="text" x-model="settings.openai_vision_model" placeholder="gpt-4o" />
           </div>
+        </div>
+        <div class="form-row">
+          <label>Ollama Vision Model</label>
+          <input type="text" x-model="settings.ollama_vision_model" placeholder="llama3.2-vision" />
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">Run <code style="color:var(--accent)">ollama list</code> in Terminal to see your installed models</div>
         </div>
       </div>
 
