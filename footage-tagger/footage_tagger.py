@@ -1373,8 +1373,15 @@ def main():
     processed = 0
 
     # Feature 4: Parallel Multi-Worker Processing
+    # Ollama can only handle 1 concurrent vision request per GPU,
+    # so force single-worker mode when using a local model.
     max_workers = config.get("max_workers", 4)
-    log.info(f"Using {max_workers} worker(s) for parallel processing")
+    provider = config.get("vision_provider", "gemini").lower()
+    if provider == "ollama" and max_workers > 1:
+        max_workers = 1
+        log.info("Ollama provider detected — using 1 worker (local GPU is sequential)")
+    else:
+        log.info(f"Using {max_workers} worker(s) for parallel processing")
 
     import threading
     failed_files = []  # Feature 3: track failed files for retry

@@ -1,7 +1,7 @@
 {
-  "version": "14.3.2",
+  "version": "14.3.3",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.2",
-  "release_notes": "v14.3.2\n\n• Fixed Qwen3 thinking mode corrupting JSON — added /no_think prefix\n• Improved clean_json to strip <think> blocks and extract JSON from noisy output",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.3",
+  "release_notes": "v14.3.3\n\n• Fixed Qwen3 thinking mode corrupting JSON — added /no_think prefix\n• Hardened JSON parser to strip <think> blocks and extract JSON from noisy output\n• Auto-limit to 1 worker when using Ollama (GPU is sequential)\n• Increased Ollama timeout to 180s",
   "required": false
 }
