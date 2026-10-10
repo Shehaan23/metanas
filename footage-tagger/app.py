@@ -110,7 +110,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.3.4"
+APP_VERSION = "14.3.5"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -1456,7 +1456,7 @@ def file_thumbnails():
     """Return a list of cached thumbnail paths for a given media file."""
     fp         = urllib.parse.unquote(request.args.get("path", ""))
     config     = load_config()
-    thumb_base = config.get("thumbnails_path", str(METANAS_HOME / "thumbnails"))
+    thumb_base = config.get("thumbnails_path", config.get("thumbnails_dir", str(METANAS_HOME / "thumbnails")))
     if not fp:
         return jsonify([])
     stem  = Path(fp).stem

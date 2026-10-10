@@ -609,7 +609,7 @@ def extract_keyframes(file_path, config, tmp_dir):
             for i, (start, _) in enumerate(scenes):
                 out = tmp_dir / f"frame_{i:04d}.jpg"
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", str(start.get_seconds()), "-i", str(file_path),
+                    ["ffmpeg", "-y", "-ss", str(start.seconds if hasattr(start, 'seconds') else start.get_seconds()), "-i", str(file_path),
                      "-frames:v", "1", "-q:v", "2", str(out)],
                     capture_output=True, timeout=120)
                 if out.exists():
@@ -1080,7 +1080,7 @@ def process_video(file_path, config, conn, reference_persons, reprocess=False):
             # ── Save keyframes to permanent thumbnails folder for UI preview ──
             try:
                 metanas_home = Path.home() / ".metanas"
-                thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+                thumb_base = Path(config.get("thumbnails_path", config.get("thumbnails_dir", str(metanas_home / "thumbnails"))))
                 thumb_dir = thumb_base / file_path.stem
                 thumb_dir.mkdir(parents=True, exist_ok=True)
                 for i, frame_path in enumerate(frames):
@@ -1181,7 +1181,7 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
                 # Save ARW preview as thumbnail for UI
                 try:
                     metanas_home = Path.home() / ".metanas"
-                    thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+                    thumb_base = Path(config.get("thumbnails_path", config.get("thumbnails_dir", str(metanas_home / "thumbnails"))))
                     thumb_dir = thumb_base / file_path.stem
                     thumb_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(preview, thumb_dir / "frame_0000.jpg")
@@ -1196,7 +1196,7 @@ def process_image(file_path, config, conn, reference_persons, reprocess=False):
         # For standard images (jpg/png), create a thumbnail copy for the UI
         try:
             metanas_home = Path.home() / ".metanas"
-            thumb_base = Path(config.get("thumbnails_path", str(metanas_home / "thumbnails")))
+            thumb_base = Path(config.get("thumbnails_path", config.get("thumbnails_dir", str(metanas_home / "thumbnails"))))
             thumb_dir = thumb_base / file_path.stem
             thumb_dir.mkdir(parents=True, exist_ok=True)
             dest = thumb_dir / "frame_0000.jpg"
