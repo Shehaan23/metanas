@@ -1,7 +1,7 @@
 {
-  "version": "14.3.5",
+  "version": "14.3.6",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.5",
-  "release_notes": "v14.3.5\n\n• Fixed thumbnails not loading (thumbnails_dir vs thumbnails_path config key mismatch)\n• Fixed system tools check PATH for .app bundle launches\n• Fixed scenedetect deprecation warning (get_seconds → seconds)\n• Added DB migration, thumbnail generator, and project discovery tools",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.6",
+  "release_notes": "v14.3.6\n\n• Discovery script now detects XMP-tagged projects (not just .db files)\n• New xmp_to_db.py tool — reconstructs project databases from XMP sidecar metadata\n• CSV now shows tagged_source column (db / xmp / none) for clearer project status",
   "required": false
 }

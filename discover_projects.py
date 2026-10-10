@@ -42,11 +42,12 @@ SKIP_KEYWORDS = {"stock", "render", "renders", "export", "exports",
 CSV_COLUMNS = [
     "project_name",
     "folder_path",
-    "status",           # tagged / untagged / partial
+    "status",           # tagged / untagged / partial / xmp_only
+    "tagged_source",    # db / xmp / none — how tagging was detected
     "total_files",
     "video_files",
     "image_files",
-    "tagged_count",     # rows in DB if tagged
+    "tagged_count",     # rows in DB or xmp sidecar count
     "custom_tags",      # comma-separated tags for this project
     "location",         # where the shoot took place
     "hotel_or_venue",   # hotel / resort / venue name
@@ -73,9 +74,24 @@ def count_media_files(folder):
     return videos, images
 
 
+def count_xmp_sidecars(folder):
+    """Count .xmp sidecar files in a folder (recursive). Their presence means
+    the media file was tagged by METANAS even if no .db was saved."""
+    count = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for f in files:
+            if f.lower().endswith(".xmp"):
+                count += 1
+    return count
+
+
 def find_project_db(folder):
-    """Check if a folder has a METANAS .db file and return row count."""
+    """Check if a folder has a METANAS .db file and return row count.
+    Falls back to counting .xmp sidecar files as evidence of tagging."""
     folder = Path(folder)
+
+    # First: look for a proper .db file
     for db_file in folder.glob("*.db"):
         try:
             conn = sqlite3.connect(str(db_file))
@@ -85,11 +101,17 @@ def find_project_db(folder):
             if cursor.fetchone():
                 count = conn.execute("SELECT COUNT(*) FROM media_files").fetchone()[0]
                 conn.close()
-                return db_file.name, count
+                return db_file.name, count, "db"
             conn.close()
         except Exception:
             pass
-    return None, 0
+
+    # Second: check for .xmp sidecar files (tagged but no .db saved)
+    xmp_count = count_xmp_sidecars(folder)
+    if xmp_count > 0:
+        return None, xmp_count, "xmp"
+
+    return None, 0, None
 
 
 def should_skip(folder_name):
@@ -171,9 +193,11 @@ def discover_projects(scan_dirs):
             if total == 0:
                 continue  # Skip empty folders
 
-            # Check if already tagged
-            db_name, tagged_count = find_project_db(root_path)
-            if tagged_count > 0:
+            # Check if already tagged (DB first, then XMP sidecars)
+            db_name, tagged_count, source = find_project_db(root_path)
+            if source == "xmp":
+                status = "xmp_only"  # tagged via XMP but no .db saved
+            elif tagged_count > 0:
                 if tagged_count >= total * 0.9:  # 90%+ tagged
                     status = "tagged"
                 else:
@@ -188,6 +212,7 @@ def discover_projects(scan_dirs):
                 "project_name": project_name,
                 "folder_path": str(root_path),
                 "status": status,
+                "tagged_source": source or "none",
                 "total_files": total,
                 "video_files": videos,
                 "image_files": images,
@@ -237,7 +262,7 @@ def write_csv(projects, output_path, existing=None):
             merged.append(proj)
 
     # Sort: untagged first, then partial, then tagged
-    status_order = {"untagged": 0, "partial": 1, "tagged": 2}
+    status_order = {"untagged": 0, "partial": 1, "xmp_only": 2, "tagged": 3}
     merged.sort(key=lambda p: (status_order.get(p.get("status", ""), 3), p.get("project_name", "")))
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -292,6 +317,7 @@ def main():
     # Stats
     untagged = sum(1 for p in merged if p.get("status") == "untagged")
     partial = sum(1 for p in merged if p.get("status") == "partial")
+    xmp_only = sum(1 for p in merged if p.get("status") == "xmp_only")
     tagged = sum(1 for p in merged if p.get("status") == "tagged")
     total_files = sum(int(p.get("total_files", 0)) for p in merged)
     untagged_files = sum(int(p.get("total_files", 0)) for p in merged if p.get("status") == "untagged")
@@ -301,7 +327,8 @@ def main():
     print("  ║   ✓  Discovery complete!                 ║")
     print("  ╠══════════════════════════════════════════╣")
     print(f"  ║   Total projects:    {len(merged):>4}                ║")
-    print(f"  ║   Already tagged:    {tagged:>4}                ║")
+    print(f"  ║   Tagged (with DB):  {tagged:>4}                ║")
+    print(f"  ║   Tagged (XMP only): {xmp_only:>4}  ← needs DB   ║")
     print(f"  ║   Partially tagged:  {partial:>4}                ║")
     print(f"  ║   Untagged:          {untagged:>4}                ║")
     print(f"  ║   Total files:    {total_files:>7,}                ║")
