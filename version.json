@@ -1,7 +1,7 @@
 {
-  "version": "14.3.6",
+  "version": "14.3.7",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.6",
-  "release_notes": "v14.3.6\n\n• Discovery script now detects XMP-tagged projects (not just .db files)\n• New xmp_to_db.py tool — reconstructs project databases from XMP sidecar metadata\n• CSV now shows tagged_source column (db / xmp / none) for clearer project status",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.7",
+  "release_notes": "v14.3.7\n\n• Fix thumbnail path mismatch — Settings UI now saves thumbnails_path consistently\n• Settings save endpoint keeps thumbnails_path and thumbnails_dir in sync\n• XMP-to-DB tool: case-insensitive file matching for NAS filesystems",
   "required": false
 }

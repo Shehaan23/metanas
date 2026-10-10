@@ -110,7 +110,7 @@ if _NEW_DB.exists():
         pass
 
 # ── App version & update check ───────────────────────────────────────────────
-APP_VERSION = "14.3.6"
+APP_VERSION = "14.3.7"
 
 # Host a public GitHub Gist with this JSON and paste its raw URL here.
 # To release an update: edit the Gist, bump "version", update the notes.
@@ -595,6 +595,12 @@ def post_settings():
         if isinstance(v, str) and "•••" in v:
             continue  # keep existing masked key
         config[k] = v
+
+    # ── Keep thumbnails_path and thumbnails_dir in sync ──
+    if "thumbnails_path" in config:
+        config["thumbnails_dir"] = config["thumbnails_path"]
+    elif "thumbnails_dir" in config:
+        config["thumbnails_path"] = config["thumbnails_dir"]
 
     # ── If db_path was updated, ensure its parent directory exists ──
     new_db = config.get("db_path", "")
@@ -3615,7 +3621,7 @@ We open on a sweeping aerial shot of the Kuala Lumpur skyline at golden hour, th
     </div>
     <div class="form-row">
       <label>Thumbnails Path</label>
-      <input type="text" x-model="settings.thumbnails_dir" placeholder="(auto — next to app.py)" />
+      <input type="text" x-model="settings.thumbnails_path" placeholder="(auto — next to app.py)" />
       <div style="font-size:11px; color:var(--muted); margin-top:4px;">Where scrubbing preview frames are saved. Leave blank for default.</div>
     </div>
 

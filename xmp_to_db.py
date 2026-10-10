@@ -285,14 +285,20 @@ def create_project_db(folder, dry_run=False, overwrite=False):
 def _find_media_for_xmp(xmp_path):
     """Find the media file that corresponds to an .xmp sidecar.
     XMP sidecars are named <media_filename>.xmp, e.g. DJI_0001.mp4.xmp
-    or DJI_0001.xmp (replacing the extension)."""
+    or DJI_0001.xmp (replacing the extension).
+    Handles case-sensitive NAS filesystems (e.g. .MP4 vs .mp4)."""
     xmp_path = Path(xmp_path)
     stem = xmp_path.stem  # e.g. "DJI_0001.mp4" or "DJI_0001"
-
-    # Case 1: XMP replaces the extension — DJI_0001.xmp → DJI_0001.mp4
     parent = xmp_path.parent
+
+    # Case 1: XMP replaces the extension — DJI_0001.xmp → DJI_0001.MP4
+    # Try exact lowercase first, then scan directory for case-insensitive match
     for ext in sorted(MEDIA_EXTS):
         candidate = parent / f"{stem}{ext}"
+        if candidate.exists():
+            return candidate
+        # Try uppercase variant
+        candidate = parent / f"{stem}{ext.upper()}"
         if candidate.exists():
             return candidate
 
@@ -301,6 +307,15 @@ def _find_media_for_xmp(xmp_path):
         candidate = parent / stem
         if candidate.exists() and candidate.suffix.lower() in MEDIA_EXTS:
             return candidate
+
+    # Case 3: Scan sibling files for case-insensitive stem match
+    stem_lower = stem.lower()
+    try:
+        for sibling in parent.iterdir():
+            if sibling.suffix.lower() in MEDIA_EXTS and sibling.stem.lower() == stem_lower:
+                return sibling
+    except PermissionError:
+        pass
 
     return None
 
@@ -402,14 +417,14 @@ def process_csv(csv_path, dry_run=False, overwrite=False, main_db=None):
         total_success += success
         total_failed += failed
 
-        if db_path and success > 0 and main_db and not dry_run:
+        if dry_run:
+            pass  # already printed in create_project_db
+        elif db_path and success > 0 and main_db:
             merged = merge_into_main_db(db_path, main_db)
             total_merged += merged
             print(f"    ✓ Created {db_path.name}: {success} files, {merged} merged to main DB")
         elif db_path and success > 0:
             print(f"    ✓ Created {db_path.name}: {success} files")
-        elif dry_run and db_path:
-            pass  # already printed in create_project_db
         print()
 
     print()
