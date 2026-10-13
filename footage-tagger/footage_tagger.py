@@ -800,7 +800,7 @@ def embed_metadata_in_video(media_path, metadata):
     cmd.append(str(media_path))
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode == 0:
             log.info(f"  ✓ Metadata embedded into: {media_path.name}")
         else:
