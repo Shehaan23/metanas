@@ -399,23 +399,37 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     elif reference_persons:
         log.info("    No face detected — skipping person ID (prevents hallucination)")
     prompt = build_vision_prompt(effective_refs)
-    images = []
+    base = ollama_url.rstrip("/")
+    # Build multi-turn messages so the model knows which image is which.
+    # Reference images go in separate earlier messages; the actual frame
+    # goes in the final message with the analysis prompt.  This prevents
+    # the model from describing a reference photo instead of the frame.
+    messages = []
     for person in effective_refs:
         ref_path = person.get("reference_image", "")
         if ref_path and Path(ref_path).exists():
-            images.append(encode_image_b64(ref_path))
-    images.append(encode_image_b64(frame_path))
-    base = ollama_url.rstrip("/")
-    # Use /api/chat (works with qwen3-vl, llava, llama3.2-vision, etc.)
-    # Prepend /no_think for Qwen3 models to disable chain-of-thought
+            messages.append({
+                "role": "user",
+                "content": f"This is a reference photo of {person['name']}. Remember this face for later identification.",
+                "images": [encode_image_b64(ref_path)]
+            })
+            messages.append({
+                "role": "assistant",
+                "content": f"I have noted the reference photo of {person['name']}."
+            })
+    # Final message: the actual frame to analyse
     effective_prompt = prompt
     if "qwen3" in model.lower():
         effective_prompt = "/no_think\n" + prompt
+    messages.append({
+        "role": "user",
+        "content": effective_prompt,
+        "images": [encode_image_b64(frame_path)]
+    })
     chat_payload = {
         "model": model, "stream": False,
         "options": {"temperature": 0.2, "num_ctx": 16384},
-        "messages": [{"role": "user", "content": effective_prompt,
-                      "images": images}],
+        "messages": messages,
     }
     for attempt in range(retries):
         try:

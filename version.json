@@ -1,7 +1,7 @@
 {
-  "version": "14.3.11",
+  "version": "14.3.12",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.11",
-  "release_notes": "v14.3.11\n\n• Fix Ollama hallucinating people — add OpenCV face detection gate before sending reference images\n• Strengthen person-ID prompt to prevent false positives\n• Increase Ollama vision timeout from 180s to 600s for local models\n• Fix Ollama 400 error — increase context window from 4K to 16K",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.12",
+  "release_notes": "v14.3.12\n\n• Fix Ollama describing reference photos instead of actual frame — use multi-turn chat messages to clearly separate reference images from analysis frame\n• OpenCV face detection gate — skip person ID entirely when no face in frame\n• Stronger anti-hallucination prompt for person identification",
   "required": false
 }
