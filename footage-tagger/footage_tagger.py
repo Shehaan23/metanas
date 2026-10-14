@@ -34,6 +34,33 @@ from pathlib import Path
 import requests
 import yaml
 
+# ── Face detection (OpenCV) — used to gate person-ID for local models ────────
+try:
+    import cv2
+    _FACE_CASCADE = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    CV2_AVAILABLE = True
+except Exception:
+    CV2_AVAILABLE = False
+    _FACE_CASCADE = None
+
+
+def frame_has_face(image_path: str) -> bool:
+    """Return True if OpenCV detects at least one face in the image."""
+    if not CV2_AVAILABLE:
+        return True  # If cv2 not available, assume face present (safe fallback)
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return True
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = _FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1,
+                                                minNeighbors=4, minSize=(40, 40))
+        return len(faces) > 0
+    except Exception:
+        return True  # On error, assume face present
+
 # ── Optional imports ──────────────────────────────────────────────────────────
 try:
     from scenedetect import open_video, SceneManager
@@ -138,10 +165,14 @@ def build_vision_prompt(reference_persons: list) -> str:
         names = ", ".join(p["name"] for p in reference_persons)
         persons_note = (
             f"\nIMPORTANT: You have been given reference photo(s) of known persons: {names}. "
-            f"Carefully compare each face in the frame against these reference photos. "
-            f"If you identify a match, include their name in 'identified_persons' AND use their "
-            f"name throughout the description. "
-            f"Only include a name if you are confident it is a match. Use an empty list if unsure."
+            f"Carefully compare each face in the LAST image (the frame to analyse) against "
+            f"the reference photos (the earlier images). "
+            f"If you identify a confident match, include their name in 'identified_persons' AND "
+            f"use their name throughout the description. "
+            f"CRITICAL: Only identify a person if you can clearly see their FACE in the frame "
+            f"and it matches the reference. If no human face is visible in the frame, "
+            f"identified_persons MUST be an empty list []. Do NOT assume someone is present "
+            f"just because a reference photo was provided."
         )
     return (
         "You are a professional video archivist creating searchable metadata for a film production "
@@ -359,9 +390,17 @@ def analyse_frame_with_gemini(frame_path, api_key, model="gemini-3.8-flash",
 def analyse_frame_with_ollama(frame_path, ollama_url, model,
                                reference_persons=None, retries=3):
     reference_persons = reference_persons or []
-    prompt = build_vision_prompt(reference_persons)
+    # Gate person-ID on face detection — local models hallucinate people
+    # when reference images are sent for frames with no humans
+    effective_refs = []
+    if reference_persons and frame_has_face(frame_path):
+        effective_refs = reference_persons
+        log.info("    Face detected — sending reference images for person ID")
+    elif reference_persons:
+        log.info("    No face detected — skipping person ID (prevents hallucination)")
+    prompt = build_vision_prompt(effective_refs)
     images = []
-    for person in reference_persons:
+    for person in effective_refs:
         ref_path = person.get("reference_image", "")
         if ref_path and Path(ref_path).exists():
             images.append(encode_image_b64(ref_path))
