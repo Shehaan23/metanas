@@ -1,7 +1,7 @@
 {
-  "version": "14.3.8",
+  "version": "14.3.9",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.8",
-  "release_notes": "v14.3.8\n\n• Increase exiftool embed timeout from 60s to 180s for videos with long descriptions\n• Fix thumbnail path mismatch — Settings UI now saves thumbnails_path consistently\n• Settings save endpoint keeps thumbnails_path and thumbnails_dir in sync",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.9",
+  "release_notes": "v14.3.9\n\n• Fix Ollama 400 error — increase context window from 4K to 16K for vision requests\n• Better Ollama error logging (shows actual response body)\n• Increase exiftool embed timeout from 60s to 180s",
   "required": false
 }

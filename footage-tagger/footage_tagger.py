@@ -374,7 +374,7 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
         effective_prompt = "/no_think\n" + prompt
     chat_payload = {
         "model": model, "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_ctx": 16384},
         "messages": [{"role": "user", "content": effective_prompt,
                       "images": images}],
     }
@@ -388,6 +388,14 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
             return json.loads(clean_json(text))
         except json.JSONDecodeError as e:
             log.warning(f"Ollama JSON parse error (attempt {attempt+1}/{retries}): {e}")
+        except requests.exceptions.HTTPError as e:
+            # Log the actual error body from Ollama for debugging
+            err_body = ""
+            if hasattr(e, "response") and e.response is not None:
+                err_body = e.response.text[:300]
+            log.warning(f"Ollama attempt {attempt+1}/{retries} failed: {e} | Response: {err_body}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
         except Exception as e:
             log.warning(f"Ollama attempt {attempt+1}/{retries} failed: {e}")
             if attempt < retries - 1:
