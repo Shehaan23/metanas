@@ -406,7 +406,7 @@ def _ollama_identify_person(frame_path, person, ollama_url, model):
     base = ollama_url.rstrip("/")
     payload = {
         "model": model, "stream": False,
-        "options": {"temperature": 0.1, "num_ctx": 4096},
+        "options": {"temperature": 0.1, "num_ctx": 16384},
         "messages": [{"role": "user", "content": id_prompt,
                       "images": [encode_image_b64(ref_path),
                                  encode_image_b64(frame_path)]}],

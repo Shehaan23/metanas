@@ -1,7 +1,7 @@
 {
-  "version": "14.3.13",
+  "version": "14.3.14",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.13",
-  "release_notes": "v14.3.13\n\n• Completely separate scene analysis from person identification for Ollama\n• Scene analysis sees ONLY the video frame — no reference images, no hallucination\n• Person ID runs as a separate focused call per reference person, only when faces detected\n• OpenCV face detection gate prevents unnecessary person-ID calls",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.14",
+  "release_notes": "v14.3.14\n\n• Fix person-ID 400 error — increase num_ctx from 4K to 16K for person identification calls",
   "required": false
 }
