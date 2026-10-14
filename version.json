@@ -1,7 +1,7 @@
 {
-  "version": "14.3.14",
+  "version": "14.3.15",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.14",
-  "release_notes": "v14.3.14\n\n• Fix person-ID 400 error — increase num_ctx from 4K to 16K for person identification calls",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.15",
+  "release_notes": "v14.3.15\n\n• Fix Ollama JSON truncation — cap output with num_predict and salvage truncated responses\n• Fix exiftool embed timeout — increase from 180s to 300s for large MP4s\n• Fix person-ID accuracy — use OpenAI for face matching when configured as secondary provider",
   "required": false
 }

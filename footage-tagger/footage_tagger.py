@@ -230,6 +230,25 @@ def clean_json(raw: str) -> str:
     last_brace = raw.rfind("}")
     if last_brace >= 0:
         raw = raw[:last_brace + 1]
+    else:
+        # No closing brace — response was truncated. Try to salvage:
+        # close any open string, close open arrays, close the object
+        raw = raw.rstrip(", \t\n\r")
+        # If we're inside an unterminated string, close it
+        in_string = False
+        for ch in raw:
+            if ch == '"' and (not in_string or raw[raw.index(ch) - 1:raw.index(ch)] != '\\'):
+                in_string = not in_string
+        # Simple heuristic: count unmatched quotes
+        quote_count = raw.count('"') - raw.count('\\"')
+        if quote_count % 2 != 0:
+            raw += '"'
+        # Close any open arrays
+        open_brackets = raw.count('[') - raw.count(']')
+        raw += ']' * max(0, open_brackets)
+        # Close any open objects
+        open_braces = raw.count('{') - raw.count('}')
+        raw += '}' * max(0, open_braces)
     return raw.strip()
 
 
@@ -424,9 +443,48 @@ def _ollama_identify_person(frame_path, person, ollama_url, model):
     return None
 
 
+def _openai_identify_person(frame_path, person, api_key, model="gpt-4o"):
+    """Use OpenAI for person-ID — much more reliable than small local models."""
+    if not OPENAI_AVAILABLE:
+        return None
+    ref_path = person.get("reference_image", "")
+    if not ref_path or not Path(ref_path).exists():
+        return None
+    name = person["name"]
+    try:
+        client = OpenAI(api_key=api_key)
+        content = [
+            {"type": "text", "text": (
+                f"I am showing you two images. The FIRST image is a reference photo of a person "
+                f"named {name}. The SECOND image is a video frame.\n\n"
+                f"Is {name} visible in the video frame (the second image)? "
+                f"Look for a clear face match — same facial features, not just similar clothing.\n\n"
+                f"Reply with ONLY one word: YES or NO."
+            )},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{encode_image_b64(ref_path)}", "detail": "low"}},
+            {"type": "text", "text": f"↑ Reference photo of {name}."},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{encode_image_b64(frame_path)}", "detail": "low"}},
+            {"type": "text", "text": "↑ Video frame to check."},
+        ]
+        response = client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": content}],
+            max_tokens=10, temperature=0.1,
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        if answer.startswith("YES"):
+            return name
+    except Exception as e:
+        log.warning(f"    OpenAI person-ID check for {name} failed: {e}")
+    return None
+
+
 def analyse_frame_with_ollama(frame_path, ollama_url, model,
-                               reference_persons=None, retries=3):
+                               reference_persons=None, retries=3,
+                               config=None):
     reference_persons = reference_persons or []
+    config = config or {}
     # ── Step 1: Scene analysis — ONLY the video frame, no reference images ──
     # This prevents the model from describing or hallucinating reference photos.
     prompt = build_vision_prompt([])  # Empty refs = no person-ID in prompt
@@ -436,7 +494,7 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     base = ollama_url.rstrip("/")
     chat_payload = {
         "model": model, "stream": False,
-        "options": {"temperature": 0.2, "num_ctx": 16384},
+        "options": {"temperature": 0.2, "num_ctx": 16384, "num_predict": 2048},
         "messages": [{"role": "user", "content": effective_prompt,
                       "images": [encode_image_b64(frame_path)]}],
     }
@@ -470,11 +528,21 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     if reference_persons and frame_has_face(frame_path):
         log.info("    Face detected — running person identification…")
         identified = []
+        # Use OpenAI for person-ID if secondary provider is configured (much more reliable)
+        secondary = config.get("secondary_vision_provider", "").lower()
+        openai_key = config.get("openai_api_key", "")
+        use_openai_for_id = secondary == "openai" and openai_key and OPENAI_AVAILABLE
         for person in reference_persons:
-            name = _ollama_identify_person(frame_path, person, ollama_url, model)
+            if use_openai_for_id:
+                name = _openai_identify_person(frame_path, person, openai_key,
+                                                config.get("openai_vision_model", "gpt-4o"))
+            else:
+                name = _ollama_identify_person(frame_path, person, ollama_url, model)
             if name:
                 identified.append(name)
                 log.info(f"    ✓ Identified: {name}")
+        if use_openai_for_id and identified:
+            log.info(f"    Person-ID via OpenAI: {', '.join(identified)}")
         result["identified_persons"] = identified
     elif reference_persons:
         log.info("    No face detected — skipping person ID")
@@ -501,7 +569,7 @@ def analyse_frame(frame_path, config, reference_persons):
         return analyse_frame_with_ollama(
             frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
             model=config.get("ollama_vision_model", "llama3.2-vision"),
-            reference_persons=reference_persons)
+            reference_persons=reference_persons, config=config)
 
 
 def analyse_frame_with_failover(frame_path, config, reference_persons):
@@ -525,7 +593,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
         result = analyse_frame_with_ollama(
             frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
             model=config.get("ollama_vision_model", "llama3.2-vision"),
-            reference_persons=reference_persons)
+            reference_persons=reference_persons, config=config)
 
     # If result is empty and secondary is configured, try secondary
     if not result and secondary and secondary != "none":
@@ -544,7 +612,7 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
             result = analyse_frame_with_ollama(
                 frame_path, ollama_url=config.get("ollama_url", "http://localhost:11434"),
                 model=config.get("ollama_vision_model", "llama3.2-vision"),
-                reference_persons=reference_persons)
+                reference_persons=reference_persons, config=config)
         provider_used = secondary if result else primary
     else:
         provider_used = primary
@@ -888,11 +956,13 @@ def embed_metadata_in_video(media_path, metadata):
     cmd.append(str(media_path))
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             log.info(f"  ✓ Metadata embedded into: {media_path.name}")
         else:
             log.warning(f"  exiftool embed warning: {result.stderr.strip()[:200]}")
+    except subprocess.TimeoutExpired:
+        log.warning(f"  exiftool embed timed out for {media_path.name} (300s) — XMP sidecar is still valid")
     except Exception as e:
         log.warning(f"  Could not embed metadata into {media_path.name}: {e}")
 
