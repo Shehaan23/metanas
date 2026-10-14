@@ -387,50 +387,60 @@ def analyse_frame_with_gemini(frame_path, api_key, model="gemini-3.8-flash",
 
 # ── Ollama Vision ─────────────────────────────────────────────────────────────
 
+def _ollama_identify_person(frame_path, person, ollama_url, model):
+    """Separate person-ID call: compare ONE reference image against the frame.
+    Returns the person's name if matched, None otherwise."""
+    ref_path = person.get("reference_image", "")
+    if not ref_path or not Path(ref_path).exists():
+        return None
+    name = person["name"]
+    id_prompt = (
+        f"I am showing you two images. The FIRST image is a reference photo of a person "
+        f"named {name}. The SECOND image is a video frame.\n\n"
+        f"Is {name} visible in the video frame (the second image)? "
+        f"Look for a clear face match — same facial features, not just similar clothing.\n\n"
+        f"Reply with ONLY one word: YES or NO."
+    )
+    if "qwen3" in model.lower():
+        id_prompt = "/no_think\n" + id_prompt
+    base = ollama_url.rstrip("/")
+    payload = {
+        "model": model, "stream": False,
+        "options": {"temperature": 0.1, "num_ctx": 4096},
+        "messages": [{"role": "user", "content": id_prompt,
+                      "images": [encode_image_b64(ref_path),
+                                 encode_image_b64(frame_path)]}],
+    }
+    try:
+        resp = requests.post(f"{base}/api/chat", json=payload, timeout=(30, 300))
+        resp.raise_for_status()
+        answer = resp.json().get("message", {}).get("content", "").strip().upper()
+        # Strip think tags for Qwen3
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip().upper()
+        if answer.startswith("YES"):
+            return name
+    except Exception as e:
+        log.warning(f"    Person-ID check for {name} failed: {e}")
+    return None
+
+
 def analyse_frame_with_ollama(frame_path, ollama_url, model,
                                reference_persons=None, retries=3):
     reference_persons = reference_persons or []
-    # Gate person-ID on face detection — local models hallucinate people
-    # when reference images are sent for frames with no humans
-    effective_refs = []
-    if reference_persons and frame_has_face(frame_path):
-        effective_refs = reference_persons
-        log.info("    Face detected — sending reference images for person ID")
-    elif reference_persons:
-        log.info("    No face detected — skipping person ID (prevents hallucination)")
-    prompt = build_vision_prompt(effective_refs)
-    base = ollama_url.rstrip("/")
-    # Build multi-turn messages so the model knows which image is which.
-    # Reference images go in separate earlier messages; the actual frame
-    # goes in the final message with the analysis prompt.  This prevents
-    # the model from describing a reference photo instead of the frame.
-    messages = []
-    for person in effective_refs:
-        ref_path = person.get("reference_image", "")
-        if ref_path and Path(ref_path).exists():
-            messages.append({
-                "role": "user",
-                "content": f"This is a reference photo of {person['name']}. Remember this face for later identification.",
-                "images": [encode_image_b64(ref_path)]
-            })
-            messages.append({
-                "role": "assistant",
-                "content": f"I have noted the reference photo of {person['name']}."
-            })
-    # Final message: the actual frame to analyse
+    # ── Step 1: Scene analysis — ONLY the video frame, no reference images ──
+    # This prevents the model from describing or hallucinating reference photos.
+    prompt = build_vision_prompt([])  # Empty refs = no person-ID in prompt
     effective_prompt = prompt
     if "qwen3" in model.lower():
         effective_prompt = "/no_think\n" + prompt
-    messages.append({
-        "role": "user",
-        "content": effective_prompt,
-        "images": [encode_image_b64(frame_path)]
-    })
+    base = ollama_url.rstrip("/")
     chat_payload = {
         "model": model, "stream": False,
         "options": {"temperature": 0.2, "num_ctx": 16384},
-        "messages": messages,
+        "messages": [{"role": "user", "content": effective_prompt,
+                      "images": [encode_image_b64(frame_path)]}],
     }
+    result = {}
     for attempt in range(retries):
         try:
             resp = requests.post(f"{base}/api/chat",
@@ -438,11 +448,11 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
             resp.raise_for_status()
             body = resp.json()
             text = body.get("message", {}).get("content", "")
-            return json.loads(clean_json(text))
+            result = json.loads(clean_json(text))
+            break
         except json.JSONDecodeError as e:
             log.warning(f"Ollama JSON parse error (attempt {attempt+1}/{retries}): {e}")
         except requests.exceptions.HTTPError as e:
-            # Log the actual error body from Ollama for debugging
             err_body = ""
             if hasattr(e, "response") and e.response is not None:
                 err_body = e.response.text[:300]
@@ -453,7 +463,24 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
             log.warning(f"Ollama attempt {attempt+1}/{retries} failed: {e}")
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
-    return {}
+    if not result:
+        return {}
+
+    # ── Step 2: Person identification — separate call, only if faces detected ──
+    if reference_persons and frame_has_face(frame_path):
+        log.info("    Face detected — running person identification…")
+        identified = []
+        for person in reference_persons:
+            name = _ollama_identify_person(frame_path, person, ollama_url, model)
+            if name:
+                identified.append(name)
+                log.info(f"    ✓ Identified: {name}")
+        result["identified_persons"] = identified
+    elif reference_persons:
+        log.info("    No face detected — skipping person ID")
+        result["identified_persons"] = []
+
+    return result
 
 
 # ── Route vision ──────────────────────────────────────────────────────────────

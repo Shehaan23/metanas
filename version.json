@@ -1,7 +1,7 @@
 {
-  "version": "14.3.12",
+  "version": "14.3.13",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.12",
-  "release_notes": "v14.3.12\n\n• Fix Ollama describing reference photos instead of actual frame — use multi-turn chat messages to clearly separate reference images from analysis frame\n• OpenCV face detection gate — skip person ID entirely when no face in frame\n• Stronger anti-hallucination prompt for person identification",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.13",
+  "release_notes": "v14.3.13\n\n• Completely separate scene analysis from person identification for Ollama\n• Scene analysis sees ONLY the video frame — no reference images, no hallucination\n• Person ID runs as a separate focused call per reference person, only when faces detected\n• OpenCV face detection gate prevents unnecessary person-ID calls",
   "required": false
 }
