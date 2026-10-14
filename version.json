@@ -1,7 +1,7 @@
 {
-  "version": "14.3.9",
+  "version": "14.3.10",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.9",
-  "release_notes": "v14.3.9\n\n• Fix Ollama 400 error — increase context window from 4K to 16K for vision requests\n• Better Ollama error logging (shows actual response body)\n• Increase exiftool embed timeout from 60s to 180s",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.10",
+  "release_notes": "v14.3.10\n\n• Increase Ollama vision timeout from 180s to 600s (10 min) — local models need more time with multiple images\n• Fix Ollama 400 error — increase context window from 4K to 16K for vision requests\n• Better Ollama error logging (shows actual response body)\n• Increase exiftool embed timeout from 60s to 180s",
   "required": false
 }

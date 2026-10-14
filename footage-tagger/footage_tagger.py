@@ -381,7 +381,7 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     for attempt in range(retries):
         try:
             resp = requests.post(f"{base}/api/chat",
-                                 json=chat_payload, timeout=180)
+                                 json=chat_payload, timeout=(30, 600))
             resp.raise_for_status()
             body = resp.json()
             text = body.get("message", {}).get("content", "")
