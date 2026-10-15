@@ -252,6 +252,17 @@ def clean_json(raw: str) -> str:
     return raw.strip()
 
 
+def safe_str(value) -> str:
+    """Ensure a value from AI response is a plain string (not dict/list)."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(str(v) for v in value.values())
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
 def safe_str_list(value) -> list:
     """Ensure a value from AI response is a flat list of strings."""
     if not value:
@@ -462,10 +473,10 @@ def _openai_identify_person(frame_path, person, api_key, model="gpt-4o"):
                 f"Reply with ONLY one word: YES or NO."
             )},
             {"type": "image_url", "image_url": {
-                "url": f"data:image/jpeg;base64,{encode_image_b64(ref_path)}", "detail": "low"}},
+                "url": f"data:image/jpeg;base64,{encode_image_b64(ref_path)}", "detail": "high"}},
             {"type": "text", "text": f"↑ Reference photo of {name}."},
             {"type": "image_url", "image_url": {
-                "url": f"data:image/jpeg;base64,{encode_image_b64(frame_path)}", "detail": "low"}},
+                "url": f"data:image/jpeg;base64,{encode_image_b64(frame_path)}", "detail": "high"}},
             {"type": "text", "text": "↑ Video frame to check."},
         ]
         response = client.chat.completions.create(
@@ -811,23 +822,23 @@ def build_xmp_fields(metadata):
 
     desc_parts = []
     if metadata.get("description"):
-        desc_parts.append(metadata["description"].strip())
+        desc_parts.append(safe_str(metadata["description"]).strip())
     if metadata.get("setting"):
-        desc_parts.append(f"Location: {metadata['setting']}.")
+        desc_parts.append(f"Location: {safe_str(metadata['setting'])}.")
     if metadata.get("lighting"):
-        desc_parts.append(f"Lighting: {metadata['lighting']}.")
+        desc_parts.append(f"Lighting: {safe_str(metadata['lighting'])}.")
     if metadata.get("camera_movement"):
-        desc_parts.append(f"Camera movement: {metadata['camera_movement']}.")
+        desc_parts.append(f"Camera movement: {safe_str(metadata['camera_movement'])}.")
     if metadata.get("motion"):
-        desc_parts.append(f"Motion detail: {metadata['motion']}.")
+        desc_parts.append(f"Motion detail: {safe_str(metadata['motion'])}.")
     if metadata.get("mood"):
-        desc_parts.append(f"Mood: {metadata['mood']}.")
+        desc_parts.append(f"Mood: {safe_str(metadata['mood'])}.")
     if metadata.get("time_of_day"):
-        desc_parts.append(f"Time of day: {metadata['time_of_day']}.")
+        desc_parts.append(f"Time of day: {safe_str(metadata['time_of_day'])}.")
     if metadata.get("audio_type"):
-        desc_parts.append(f"Audio: {metadata['audio_type']}.")
+        desc_parts.append(f"Audio: {safe_str(metadata['audio_type'])}.")
     if metadata.get("color_palette"):
-        desc_parts.append(f"Color palette: {metadata['color_palette']}.")
+        desc_parts.append(f"Color palette: {safe_str(metadata['color_palette'])}.")
     if metadata.get("shot_type"):
         desc_parts.append(f"Shot type: {metadata['shot_type']}.")
     subjects = safe_str_list(metadata.get("subjects", []))
@@ -842,22 +853,15 @@ def build_xmp_fields(metadata):
     tags = list(persons)  # persons first
     tags.extend(safe_str_list(metadata.get("tags", [])))
     tags.extend(safe_str_list(metadata.get("mood_tags", [])))  # conceptual/mood tags
-    if metadata.get("shot_type"):
-        tags.append(metadata["shot_type"])
-    if metadata.get("camera_movement"):
-        tags.append(metadata["camera_movement"])
-    if metadata.get("mood"):
-        tags.append(metadata["mood"])
-    if metadata.get("time_of_day"):
-        tags.append(metadata["time_of_day"])
-    if metadata.get("audio_type"):
-        tags.append(metadata["audio_type"])
-    if metadata.get("color_palette"):
-        tags.append(metadata["color_palette"])
+    for key in ("shot_type", "camera_movement", "mood", "time_of_day",
+                 "audio_type", "color_palette"):
+        if metadata.get(key):
+            tags.append(safe_str(metadata[key]))
     if metadata.get("camera_model") and metadata["camera_model"] != "Unknown":
-        tags.append(metadata["camera_model"])
+        tags.append(safe_str(metadata["camera_model"]))
     if metadata.get("setting"):
-        setting_words = [w.strip(",.()") for w in metadata["setting"].split() if len(w) > 3]
+        setting_val = safe_str(metadata["setting"])
+        setting_words = [w.strip(",.()") for w in setting_val.split() if len(w) > 3]
         tags.extend(setting_words[:5])
 
     seen, unique_tags = set(), []

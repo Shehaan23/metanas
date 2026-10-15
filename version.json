@@ -1,7 +1,7 @@
 {
-  "version": "14.3.15",
+  "version": "14.3.16",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.15",
-  "release_notes": "v14.3.15\n\n• Fix Ollama JSON truncation — cap output with num_predict and salvage truncated responses\n• Fix exiftool embed timeout — increase from 180s to 300s for large MP4s\n• Fix person-ID accuracy — use OpenAI for face matching when configured as secondary provider",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.16",
+  "release_notes": "v14.3.16\n\n• Fix person-ID — switch OpenAI image detail from low to high for accurate face comparison\n• Fix crash when Ollama returns dict instead of string for metadata fields\n• Add safe_str() helper to handle unexpected AI response types",
   "required": false
 }
