@@ -499,8 +499,51 @@ def _identify_persons_face_rec(frame_path, reference_persons, tolerance=0.55):
     return identified
 
 
+def _gemini_identify_person(frame_path, person, api_key, model="gemini-3.8-flash"):
+    """Dedicated Gemini person-ID: compare ONE reference image against the frame.
+    Uses the google-genai SDK directly. Returns the person's name if matched."""
+    if not GEMINI_AVAILABLE:
+        return None
+    ref_path = person.get("reference_image", "")
+    if not ref_path or not Path(ref_path).exists():
+        return None
+    name = person["name"]
+    try:
+        client = google_genai.Client(api_key=api_key)
+        id_prompt = (
+            f"I am showing you two images. The FIRST image is a reference photo of a person "
+            f"named {name}. The SECOND image is a video frame.\n\n"
+            f"Is {name} visible in the video frame (the second image)? "
+            f"Look for a clear face match — same facial features, not just similar clothing.\n\n"
+            f"Reply with ONLY one word: YES or NO."
+        )
+        contents = [
+            f"Reference photo of {name}:",
+            PIL.Image.open(ref_path),
+            "Frame to check:",
+            PIL.Image.open(str(frame_path)),
+            id_prompt,
+        ]
+        # Throttle to respect rate limits
+        elapsed = time.time() - LAST_API_CALL_TIME["timestamp"]
+        if elapsed < MIN_API_INTERVAL:
+            time.sleep(MIN_API_INTERVAL - elapsed)
+        LAST_API_CALL_TIME["timestamp"] = time.time()
+
+        response = client.models.generate_content(
+            model=model, contents=contents,
+            config=google_genai_types.GenerateContentConfig(
+                temperature=0.1, max_output_tokens=10))
+        answer = response.text.strip().upper()
+        if answer.startswith("YES"):
+            return name
+    except Exception as e:
+        log.warning(f"    Gemini person-ID check for {name} failed: {e}")
+    return None
+
+
 def _openai_identify_person(frame_path, person, api_key, model="gpt-4o"):
-    """Person-ID via OpenAI-compatible API (works with Gemini, not with GPT-4o
+    """Person-ID via OpenAI-compatible API (works with Gemini-via-OpenAI, not with GPT-4o
     which refuses facial recognition). Returns the person's name if matched."""
     if not OPENAI_AVAILABLE:
         return None
@@ -689,6 +732,7 @@ def analyse_frame(frame_path, config, reference_persons):
 
 def analyse_frame_with_failover(frame_path, config, reference_persons):
     """Try primary provider, fall back to secondary if primary returns empty dict.
+    After scene analysis, run face_recognition for person-ID (works with all providers).
     Returns (result_dict, provider_used_string)."""
     primary = config.get("vision_provider", "ollama").lower()
     secondary = config.get("secondary_vision_provider", "").lower() or ""
@@ -731,6 +775,45 @@ def analyse_frame_with_failover(frame_path, config, reference_persons):
         provider_used = secondary if result else primary
     else:
         provider_used = primary
+
+    # ── Post-processing: dedicated person-ID step (provider-independent) ──
+    # Runs after scene analysis for ALL providers.
+    # Priority: face_recognition (dlib) > Gemini vision > OpenAI-compat > Ollama
+    if result and reference_persons:
+        ai_persons = result.get("identified_persons", [])
+        # Only run dedicated person-ID if scene analysis didn't already find people,
+        # OR always run face_recognition/Gemini as a second opinion
+        if frame_has_face(frame_path):
+            log.info("    Face detected — running dedicated person-ID step")
+            dedicated_ids = []
+
+            if FACE_REC_AVAILABLE:
+                # Best: dlib face encoding comparison (local, fast, accurate)
+                log.info("    Using face_recognition (dlib)")
+                dedicated_ids = _identify_persons_face_rec(frame_path, reference_persons)
+            elif GEMINI_AVAILABLE and config.get("gemini_api_key"):
+                # Second best: Gemini vision (reliable for face matching)
+                gemini_model = config.get("gemini_vision_model", "gemini-3.8-flash")
+                log.info(f"    Using Gemini ({gemini_model}) for person-ID")
+                for person in reference_persons:
+                    name = _gemini_identify_person(
+                        frame_path, person,
+                        config["gemini_api_key"], gemini_model)
+                    if name:
+                        dedicated_ids.append(name)
+            else:
+                log.info("    No dedicated person-ID available (face_recognition not installed, no Gemini key)")
+
+            if dedicated_ids:
+                for name in dedicated_ids:
+                    log.info(f"    ✓ Identified: {name}")
+                # Merge with any AI-identified persons (avoid duplicates)
+                merged = list(dict.fromkeys(ai_persons + dedicated_ids))
+                result["identified_persons"] = merged
+            else:
+                log.info("    Dedicated person-ID found no matches")
+        else:
+            log.info("    No face detected (Haar cascade) — skipping dedicated person-ID")
 
     return result, provider_used
 
