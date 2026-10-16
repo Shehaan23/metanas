@@ -1,7 +1,7 @@
 {
-  "version": "14.3.16",
+  "version": "14.3.17",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
-  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.16",
-  "release_notes": "v14.3.16\n\n• Fix person-ID — switch OpenAI image detail from low to high for accurate face comparison\n• Fix crash when Ollama returns dict instead of string for metadata fields\n• Add safe_str() helper to handle unexpected AI response types",
+  "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.17",
+  "release_notes": "v14.3.17\n\n• Replace AI-based person-ID with dlib face_recognition library for accurate face matching\n• Uses face encoding comparison (not AI prompting) — works locally, no API policy restrictions\n• Caches reference face encodings for performance\n• Tolerance 0.55 (stricter than default) to reduce false positives\n• Falls back to Ollama vision if face_recognition not installed",
   "required": false
 }

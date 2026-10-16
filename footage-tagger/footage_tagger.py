@@ -61,6 +61,14 @@ def frame_has_face(image_path: str) -> bool:
     except Exception:
         return True  # On error, assume face present
 
+# ── Face recognition (dlib) — used for person-ID via face encoding comparison ─
+try:
+    import face_recognition as _face_rec
+    FACE_REC_AVAILABLE = True
+except ImportError:
+    FACE_REC_AVAILABLE = False
+    _face_rec = None
+
 # ── Optional imports ──────────────────────────────────────────────────────────
 try:
     from scenedetect import open_video, SceneManager
@@ -417,45 +425,83 @@ def analyse_frame_with_gemini(frame_path, api_key, model="gemini-3.8-flash",
 
 # ── Ollama Vision ─────────────────────────────────────────────────────────────
 
-def _ollama_identify_person(frame_path, person, ollama_url, model):
-    """Separate person-ID call: compare ONE reference image against the frame.
-    Returns the person's name if matched, None otherwise."""
+# ── Face-encoding cache for reference persons (populated once per run) ────────
+_ref_encoding_cache: dict = {}   # {ref_image_path: (name, [encodings])}
+
+
+def _load_ref_encoding(person):
+    """Load and cache face encoding(s) for one reference person.
+    Returns (name, list_of_encodings) or None."""
     ref_path = person.get("reference_image", "")
     if not ref_path or not Path(ref_path).exists():
         return None
     name = person["name"]
-    id_prompt = (
-        f"I am showing you two images. The FIRST image is a reference photo of a person "
-        f"named {name}. The SECOND image is a video frame.\n\n"
-        f"Is {name} visible in the video frame (the second image)? "
-        f"Look for a clear face match — same facial features, not just similar clothing.\n\n"
-        f"Reply with ONLY one word: YES or NO."
-    )
-    if "qwen3" in model.lower():
-        id_prompt = "/no_think\n" + id_prompt
-    base = ollama_url.rstrip("/")
-    payload = {
-        "model": model, "stream": False,
-        "options": {"temperature": 0.1, "num_ctx": 16384},
-        "messages": [{"role": "user", "content": id_prompt,
-                      "images": [encode_image_b64(ref_path),
-                                 encode_image_b64(frame_path)]}],
-    }
+    if ref_path in _ref_encoding_cache:
+        return _ref_encoding_cache[ref_path]
     try:
-        resp = requests.post(f"{base}/api/chat", json=payload, timeout=(30, 300))
-        resp.raise_for_status()
-        answer = resp.json().get("message", {}).get("content", "").strip().upper()
-        # Strip think tags for Qwen3
-        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip().upper()
-        if answer.startswith("YES"):
-            return name
+        ref_img = _face_rec.load_image_file(ref_path)
+        encodings = _face_rec.face_encodings(ref_img)
+        if not encodings:
+            log.warning(f"    No face found in reference image for {name}: {ref_path}")
+            _ref_encoding_cache[ref_path] = (name, [])
+            return None
+        _ref_encoding_cache[ref_path] = (name, encodings)
+        return (name, encodings)
     except Exception as e:
-        log.warning(f"    Person-ID check for {name} failed: {e}")
-    return None
+        log.warning(f"    Failed to load reference encoding for {name}: {e}")
+        return None
+
+
+def _identify_persons_face_rec(frame_path, reference_persons, tolerance=0.55):
+    """Identify persons in a frame using dlib face_recognition library.
+    Compares face encodings from the frame against reference person encodings.
+    Returns list of matched person names.
+
+    tolerance: lower = stricter matching. Default 0.55 (stricter than
+    library default of 0.6) to reduce false positives.
+    """
+    if not FACE_REC_AVAILABLE or not _face_rec:
+        return []
+
+    # Load reference encodings
+    refs = []
+    for person in reference_persons:
+        result = _load_ref_encoding(person)
+        if result and result[1]:  # has at least one encoding
+            refs.append(result)
+    if not refs:
+        log.warning("    No valid reference encodings — skipping face_recognition")
+        return []
+
+    # Load frame and get face encodings
+    try:
+        frame_img = _face_rec.load_image_file(str(frame_path))
+        frame_face_locations = _face_rec.face_locations(frame_img, model="hog")
+        if not frame_face_locations:
+            log.info("    face_recognition found no faces in frame")
+            return []
+        frame_encodings = _face_rec.face_encodings(frame_img, frame_face_locations)
+    except Exception as e:
+        log.warning(f"    face_recognition failed to process frame: {e}")
+        return []
+
+    # Compare each frame face against each reference person
+    identified = []
+    for name, ref_encs in refs:
+        matched = False
+        for frame_enc in frame_encodings:
+            distances = _face_rec.face_distance(ref_encs, frame_enc)
+            if any(d <= tolerance for d in distances):
+                matched = True
+                break
+        if matched:
+            identified.append(name)
+    return identified
 
 
 def _openai_identify_person(frame_path, person, api_key, model="gpt-4o"):
-    """Use OpenAI for person-ID — much more reliable than small local models."""
+    """Person-ID via OpenAI-compatible API (works with Gemini, not with GPT-4o
+    which refuses facial recognition). Returns the person's name if matched."""
     if not OPENAI_AVAILABLE:
         return None
     ref_path = person.get("reference_image", "")
@@ -488,6 +534,43 @@ def _openai_identify_person(frame_path, person, api_key, model="gpt-4o"):
             return name
     except Exception as e:
         log.warning(f"    OpenAI person-ID check for {name} failed: {e}")
+    return None
+
+
+def _ollama_identify_person(frame_path, person, ollama_url, model):
+    """Fallback: Ollama vision person-ID (unreliable with small models).
+    Returns the person's name if matched, None otherwise."""
+    ref_path = person.get("reference_image", "")
+    if not ref_path or not Path(ref_path).exists():
+        return None
+    name = person["name"]
+    id_prompt = (
+        f"I am showing you two images. The FIRST image is a reference photo of a person "
+        f"named {name}. The SECOND image is a video frame.\n\n"
+        f"Is {name} visible in the video frame (the second image)? "
+        f"Look for a clear face match — same facial features, not just similar clothing.\n\n"
+        f"Reply with ONLY one word: YES or NO."
+    )
+    if "qwen3" in model.lower():
+        id_prompt = "/no_think\n" + id_prompt
+    base = ollama_url.rstrip("/")
+    payload = {
+        "model": model, "stream": False,
+        "options": {"temperature": 0.1, "num_ctx": 16384},
+        "messages": [{"role": "user", "content": id_prompt,
+                      "images": [encode_image_b64(ref_path),
+                                 encode_image_b64(frame_path)]}],
+    }
+    try:
+        resp = requests.post(f"{base}/api/chat", json=payload, timeout=(30, 300))
+        resp.raise_for_status()
+        answer = resp.json().get("message", {}).get("content", "").strip().upper()
+        # Strip think tags for Qwen3
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip().upper()
+        if answer.startswith("YES"):
+            return name
+    except Exception as e:
+        log.warning(f"    Person-ID check for {name} failed: {e}")
     return None
 
 
@@ -539,21 +622,42 @@ def analyse_frame_with_ollama(frame_path, ollama_url, model,
     if reference_persons and frame_has_face(frame_path):
         log.info("    Face detected — running person identification…")
         identified = []
-        # Use OpenAI for person-ID if secondary provider is configured (much more reliable)
+
+        # Determine available secondary provider (Gemini etc.)
         secondary = config.get("secondary_vision_provider", "").lower()
         openai_key = config.get("openai_api_key", "")
-        use_openai_for_id = secondary == "openai" and openai_key and OPENAI_AVAILABLE
-        for person in reference_persons:
-            if use_openai_for_id:
-                name = _openai_identify_person(frame_path, person, openai_key,
-                                                config.get("openai_vision_model", "gpt-4o"))
-            else:
-                name = _ollama_identify_person(frame_path, person, ollama_url, model)
-            if name:
-                identified.append(name)
+        secondary_model = config.get("openai_vision_model", "gpt-4o")
+        # Only use secondary for person-ID if it's NOT pure OpenAI GPT-4o
+        # (GPT-4o refuses facial recognition due to policy)
+        is_gemini = secondary == "openai" and openai_key and OPENAI_AVAILABLE and "gpt" not in secondary_model.lower()
+
+        if FACE_REC_AVAILABLE:
+            # Preferred: dlib face_recognition — fast, accurate, no API needed
+            log.info("    Using face_recognition (dlib) for person-ID")
+            identified = _identify_persons_face_rec(frame_path, reference_persons)
+            for name in identified:
                 log.info(f"    ✓ Identified: {name}")
-        if use_openai_for_id and identified:
-            log.info(f"    Person-ID via OpenAI: {', '.join(identified)}")
+            if not identified:
+                log.info("    face_recognition found no matches")
+        elif is_gemini:
+            # Second choice: Gemini via OpenAI-compatible API (works for person-ID)
+            log.info("    face_recognition not available — using Gemini for person-ID")
+            for person in reference_persons:
+                name = _openai_identify_person(frame_path, person, openai_key, secondary_model)
+                if name:
+                    identified.append(name)
+                    log.info(f"    ✓ Identified: {name}")
+            if identified:
+                log.info(f"    Person-ID via Gemini: {', '.join(identified)}")
+        else:
+            # Last resort: Ollama vision (unreliable with small models)
+            log.info("    face_recognition not available — falling back to Ollama vision")
+            for person in reference_persons:
+                name = _ollama_identify_person(frame_path, person, ollama_url, model)
+                if name:
+                    identified.append(name)
+                    log.info(f"    ✓ Identified: {name}")
+
         result["identified_persons"] = identified
     elif reference_persons:
         log.info("    No face detected — skipping person ID")
