@@ -1,5 +1,5 @@
 {
-  "version": "14.3.19",
+  "version": "14.3.21",
   "file_url": "https://raw.githubusercontent.com/Shehaan23/metanas/main/footage-tagger/app.py",
   "download_url": "https://github.com/Shehaan23/metanas/releases/tag/v14.3.19",
   "release_notes": "v14.3.19\n\n• Add dedicated Gemini person-ID as fallback when face_recognition unavailable\n• Person-ID now runs as post-processing step for ALL vision providers\n• Priority: face_recognition (dlib) → Gemini vision → scene analysis inline\n• Uses google-genai SDK directly — no extra library needed",
