@@ -44,6 +44,14 @@ try:
 except Exception:
     APP_VERSION = "unknown"
 
+# ── WhisperX (word-level timestamps + speaker diarization) ───────────────────
+try:
+    import whisperx as _whisperx
+    WHISPERX_AVAILABLE = True
+except ImportError:
+    WHISPERX_AVAILABLE = False
+    _whisperx = None
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 log = logging.getLogger("metanas.cli")
 
@@ -84,6 +92,110 @@ except ImportError:
         return h.hexdigest()
     log.warning("xxhash not installed — using blake2b as hash fallback. "
                 "Install xxhash for spec-compliant hashing: pip install xxhash")
+
+
+# ── WhisperX transcription ────────────────────────────────────────────────────
+
+def transcribe_whisperx(file_path: Path, config: dict, duration: float
+                        ) -> tuple[str, list[dict]]:
+    """Transcribe with WhisperX: word-level timestamps + speaker labels.
+
+    Returns (plain_text, word_list) where word_list is:
+        [{"start": float, "end": float, "word": str, "speaker": str}, ...]
+
+    Falls back to the engine's faster_whisper if WhisperX is unavailable,
+    returning a single-entry word list covering the whole clip.
+    """
+    if not WHISPERX_AVAILABLE:
+        # Fallback: use the existing engine transcription (plain text only)
+        text = engine.transcribe_audio(file_path, config)
+        if text:
+            words = [{"start": 0.0, "end": duration,
+                       "word": text, "speaker": "unknown"}]
+            return text, words
+        return "", []
+
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        whisper_model = config.get("whisper_model", "medium")
+        batch_size = 8 if device == "cuda" else 4
+
+        # 1. Load model and transcribe
+        model = _whisperx.load_model(whisper_model, device,
+                                      compute_type=compute_type)
+
+        # Extract audio to WAV first (same approach as the engine)
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "audio.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(file_path),
+                 "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                 str(wav_path)],
+                capture_output=True, timeout=300
+            )
+            if not wav_path.exists():
+                raise RuntimeError("ffmpeg audio extraction failed")
+
+            audio = _whisperx.load_audio(str(wav_path))
+
+        result = model.transcribe(audio, batch_size=batch_size)
+
+        # 2. Align word-level timestamps
+        model_a, metadata_a = _whisperx.load_align_model(
+            language_code=result.get("language", "en"), device=device
+        )
+        result = _whisperx.align(
+            result["segments"], model_a, metadata_a, audio, device,
+            return_char_alignments=False
+        )
+
+        # 3. Speaker diarization (optional — requires HuggingFace token)
+        hf_token = config.get("hf_token", os.environ.get("HF_TOKEN", ""))
+        if hf_token:
+            try:
+                diarize_model = _whisperx.DiarizationPipeline(
+                    use_auth_token=hf_token, device=device
+                )
+                diarize_segments = diarize_model(audio)
+                result = _whisperx.assign_word_speakers(diarize_segments, result)
+            except Exception as e:
+                log.warning(f"  Speaker diarization failed (non-fatal): {e}")
+
+        # 4. Extract word-level data
+        words = []
+        for seg in result.get("segments", []):
+            speaker = seg.get("speaker", "unknown")
+            for w in seg.get("words", []):
+                words.append({
+                    "start": round(w.get("start", 0), 3),
+                    "end": round(w.get("end", 0), 3),
+                    "word": w.get("word", ""),
+                    "speaker": speaker,
+                })
+
+        # Plain text from all segments
+        plain_text = " ".join(
+            seg.get("text", "") for seg in result.get("segments", [])
+        ).strip()
+
+        if not words and plain_text:
+            # Alignment failed but we have text — single entry fallback
+            words = [{"start": 0.0, "end": duration,
+                       "word": plain_text, "speaker": "unknown"}]
+
+        log.info(f"  WhisperX: {len(words)} words, "
+                 f"{len(set(w['speaker'] for w in words))} speaker(s)")
+        return plain_text, words
+
+    except Exception as e:
+        log.warning(f"  WhisperX failed, falling back to faster_whisper: {e}")
+        text = engine.transcribe_audio(file_path, config)
+        if text:
+            return text, [{"start": 0.0, "end": duration,
+                            "word": text, "speaker": "unknown"}]
+        return "", []
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -695,17 +807,13 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
             except Exception:
                 pass
 
-        # 5. Transcription (existing engine)
+        # 5. Transcription — WhisperX (word-level + speakers) with faster_whisper fallback
         transcription = ""
         transcript_words = []
         if has_audio:
-            transcription = engine.transcribe_audio(file_path, config)
-            # Note: faster_whisper returns plain text only.
-            # Word-level timestamps require WhisperX (future upgrade).
-            # For now, store plain text as a single word entry.
-            if transcription:
-                transcript_words = [{"start": 0, "end": duration,
-                                     "word": transcription, "speaker": "unknown"}]
+            transcription, transcript_words = transcribe_whisperx(
+                file_path, config, duration
+            )
 
         # 6. Face matching and tags (existing engine)
         metadata = {"transcription": transcription}
