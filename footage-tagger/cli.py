@@ -56,9 +56,13 @@ except ImportError:
 log = logging.getLogger("metanas.cli")
 
 # ── Constants ────────────────────────────────────────────────────────────────
-# SOP folder pattern: _Footage_<Camera>_dayN
+# SOP folder pattern: _Footage_<Camera>_dayN  (newer projects)
 _SOP_CAMERA_RE = re.compile(
     r"_Footage_(?P<camera>[A-Za-z0-9]+)_day(?P<day>\d+)", re.IGNORECASE
+)
+# Older projects: _Footage_<Camera> (no dayN suffix)
+_SOP_CAMERA_NODAY_RE = re.compile(
+    r"_Footage_(?P<camera>[A-Za-z0-9]+)$", re.IGNORECASE
 )
 
 CAMERA_ALIASES = {
@@ -250,9 +254,11 @@ def find_video_files(root: Path, cameras: list | None = None) -> list[Path]:
 def parse_camera_day(file_path: Path) -> tuple[str, int]:
     """Extract camera and day from the SOP folder hierarchy.
 
-    Looks for a parent folder matching _Footage_<Camera>_dayN.
+    Tries _Footage_<Camera>_dayN first (newer SOP).
+    Falls back to _Footage_<Camera> (older projects like Hiriketiya).
     Returns (camera, day) or (None, 0).
     """
+    # Pass 1: newer pattern with dayN
     for parent in file_path.parents:
         m = _SOP_CAMERA_RE.search(parent.name)
         if m:
@@ -260,6 +266,13 @@ def parse_camera_day(file_path: Path) -> tuple[str, int]:
             cam = CAMERA_ALIASES.get(cam_raw, cam_raw)
             day = int(m.group("day"))
             return cam, day
+    # Pass 2: older pattern without dayN
+    for parent in file_path.parents:
+        m = _SOP_CAMERA_NODAY_RE.search(parent.name)
+        if m:
+            cam_raw = m.group("camera")
+            cam = CAMERA_ALIASES.get(cam_raw, cam_raw)
+            return cam, 0
     return None, 0
 
 

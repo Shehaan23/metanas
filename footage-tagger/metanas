@@ -6,7 +6,15 @@
 
 METANAS_HOME="$HOME/.metanas"
 VENV="$METANAS_HOME/.venv"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks so SCRIPT_DIR points to the real location, not /usr/local/bin
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    # If readlink returned a relative path, resolve it against the dir
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 
 # Prefer shadow-updated cli.py if present
 if [ -f "$METANAS_HOME/updates/cli.py" ]; then
