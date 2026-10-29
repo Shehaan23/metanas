@@ -3,7 +3,7 @@
 METANAS CLI — headless ingest and index commands.
 
 Usage:
-    metanas ingest <footage_folder> [--out <brief_folder>] [--resume] [--cameras A7S3,ZVE1] [--workers N] [--quiet] [--dry-run]
+    metanas ingest <footage_folder> [--out <brief_folder>] [--resume] [--no-embed] [--cameras A7S3,ZVE1] [--workers N] [--quiet] [--dry-run]
     metanas index  <footage_folder> [--out <brief_folder>]
     metanas --version
 """
@@ -242,7 +242,7 @@ def find_video_files(root: Path, cameras: list | None = None) -> list[Path]:
     cam_set = {c.lower() for c in cameras}
     filtered = []
     for p in all_videos:
-        cam, _ = parse_camera_day(p)
+        cam, _raw, _day = parse_camera_day(p)
         if cam and cam.lower() in cam_set:
             filtered.append(p)
         elif not cam:
@@ -251,29 +251,41 @@ def find_video_files(root: Path, cameras: list | None = None) -> list[Path]:
     return filtered
 
 
-def parse_camera_day(file_path: Path) -> tuple[str, int]:
+def parse_camera_day(file_path: Path, config: dict | None = None
+                     ) -> tuple[str, str | None, int]:
     """Extract camera and day from the SOP folder hierarchy.
 
     Tries _Footage_<Camera>_dayN first (newer SOP).
     Falls back to _Footage_<Camera> (older projects like Hiriketiya).
-    Returns (camera, day) or (None, 0).
+    Returns (camera_sop, camera_raw, day).
+    camera_sop is the SOP-normalised name (via aliases).
+    camera_raw is the raw folder token before alias mapping.
+    Returns (None, None, 0) if no camera folder found.
     """
+    # Merge config-level aliases on top of built-in ones
+    aliases = dict(CAMERA_ALIASES)
+    if config:
+        for k, v in config.get("camera_aliases", {}).items():
+            aliases[k] = v
+
+    def _resolve(raw: str) -> tuple[str, str]:
+        sop = aliases.get(raw, raw)
+        return sop, raw
+
     # Pass 1: newer pattern with dayN
     for parent in file_path.parents:
         m = _SOP_CAMERA_RE.search(parent.name)
         if m:
-            cam_raw = m.group("camera")
-            cam = CAMERA_ALIASES.get(cam_raw, cam_raw)
+            sop, raw = _resolve(m.group("camera"))
             day = int(m.group("day"))
-            return cam, day
+            return sop, raw, day
     # Pass 2: older pattern without dayN
     for parent in file_path.parents:
         m = _SOP_CAMERA_NODAY_RE.search(parent.name)
         if m:
-            cam_raw = m.group("camera")
-            cam = CAMERA_ALIASES.get(cam_raw, cam_raw)
-            return cam, 0
-    return None, 0
+            sop, raw = _resolve(m.group("camera"))
+            return sop, raw, 0
+    return None, None, 0
 
 
 def make_clip_id(camera: str | None, day: int, file_path: Path) -> str:
@@ -327,113 +339,190 @@ def compute_audio_rms(file_path: Path) -> tuple[float, float]:
         return float("-inf"), 1.0
 
 
-def detect_lip_sync_issues(file_path: Path, tech_meta: dict,
-                           audio_rms_dbfs: float) -> tuple[bool, list]:
-    """Check for lip motion without matching audio.
+def _build_silent_spans(file_path: Path, duration: float, has_audio: bool
+                        ) -> list[list[float]]:
+    """Find contiguous silent spans (below -50 dBFS) longer than 3 seconds.
 
-    Simple heuristic: if a face is on screen (checked via OpenCV) and
-    the audio is absent or below -50 dBFS for spans > 3s, flag it.
-    Returns (needs_manual_sync, sync_spans as [[start, end], ...]).
+    A clip with no audio track is one silent span covering its whole length.
+    Returns [[start, end], ...] in seconds.
     """
-    if audio_rms_dbfs > -50:
-        return False, []
-
-    duration = tech_meta.get("duration", 0)
-    if duration < 3:
-        return False, []
+    if not has_audio or duration < 3:
+        if duration >= 3 and not has_audio:
+            return [[0.0, round(duration, 1)]]
+        return []
 
     try:
-        # Sample a few frames and check for faces
         import numpy as np
-        positions = [duration * 0.25, duration * 0.5, duration * 0.75]
-        face_found = False
-        with tempfile.TemporaryDirectory() as tmp:
-            for i, pos in enumerate(positions):
-                frame_path = Path(tmp) / f"sync_check_{i}.jpg"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-ss", str(pos), "-i", str(file_path),
-                     "-frames:v", "1", "-q:v", "5", str(frame_path)],
-                    capture_output=True, timeout=30
-                )
-                if frame_path.exists() and engine.frame_has_face(str(frame_path)):
-                    face_found = True
-                    break
-
-        if not face_found:
-            return False, []
-
-        # Face found + audio below threshold → flag entire clip
-        # More granular: check 3s windows
-        sync_spans = []
-        window = 3.0
-        n_windows = int(duration / window)
-        # Use ffmpeg to get audio levels per window
         result = subprocess.run(
             ["ffmpeg", "-i", str(file_path), "-vn", "-ac", "1", "-ar", "16000",
              "-f", "s16le", "-"],
             capture_output=True, timeout=300
         )
-        if result.returncode == 0 and len(result.stdout) > 100:
-            samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-            window_samples = int(window * 16000)
-            for i in range(n_windows):
-                chunk = samples[i * window_samples:(i + 1) * window_samples]
-                if len(chunk) < window_samples // 2:
-                    continue
-                w_rms = np.sqrt(np.mean(chunk ** 2))
-                w_db = 20 * np.log10(max(w_rms, 1e-10))
-                if w_db < -50:
-                    start_s = round(i * window, 1)
-                    end_s = round(min((i + 1) * window, duration), 1)
-                    sync_spans.append([start_s, end_s])
+        if result.returncode != 0 or len(result.stdout) < 100:
+            # No decodable audio — treat as silent
+            return [[0.0, round(duration, 1)]] if duration >= 3 else []
 
-            # Merge adjacent spans
-            if sync_spans:
-                merged = [sync_spans[0]]
-                for s in sync_spans[1:]:
-                    if s[0] <= merged[-1][1] + 0.1:
-                        merged[-1][1] = s[1]
-                    else:
-                        merged.append(s)
-                # Only flag if at least one span > 3s
-                sync_spans = [s for s in merged if (s[1] - s[0]) >= 3.0]
+        samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
-        if sync_spans:
-            return True, sync_spans
-        return False, []
+        # Walk 0.5s windows, mark silent ones
+        window_size = 8000  # 0.5s at 16kHz
+        n_windows = max(1, len(samples) // window_size)
+        silent_flags = []
+        for i in range(n_windows):
+            chunk = samples[i * window_size:(i + 1) * window_size]
+            w_rms = np.sqrt(np.mean(chunk ** 2))
+            w_db = 20 * np.log10(max(w_rms, 1e-10))
+            silent_flags.append(w_db < -50)
+
+        # Build contiguous silent spans > 3s
+        spans = []
+        span_start = None
+        for i, is_silent in enumerate(silent_flags):
+            t = i * 0.5
+            if is_silent and span_start is None:
+                span_start = t
+            elif not is_silent and span_start is not None:
+                span_end = t
+                if span_end - span_start >= 3.0:
+                    spans.append([round(span_start, 1), round(span_end, 1)])
+                span_start = None
+        # Close trailing span
+        if span_start is not None:
+            span_end = n_windows * 0.5
+            if span_end - span_start >= 3.0:
+                spans.append([round(span_start, 1), round(min(span_end, duration), 1)])
+
+        return spans
 
     except Exception as e:
-        log.warning(f"  Lip sync check failed: {e}")
+        log.warning(f"  Silent-span detection failed: {e}")
+        return []
+
+
+def detect_needs_manual_sync(file_path: Path, tech_meta: dict,
+                             audio_rms_dbfs: float, has_audio: bool,
+                             metadata: dict) -> tuple[bool, list]:
+    """Flag clips where a person is visibly speaking but audio is absent.
+
+    For each silent span (>3s, below -50 dBFS), sample frames at 2fps and
+    run the engine's face-detection check. If a known face with mouth motion
+    is present in >50% of sampled frames, the span is a sync span.
+
+    Returns (needs_manual_sync, sync_spans as [[start, end], ...]).
+    Precision matters less than recall: a false flag costs 10s, a miss costs a scene.
+    """
+    duration = tech_meta.get("duration", 0)
+    silent_spans = _build_silent_spans(file_path, duration, has_audio)
+
+    if not silent_spans:
         return False, []
 
+    # If we already know there are identified persons from vision analysis,
+    # we can use that as a strong signal without re-sampling every span
+    persons = metadata.get("identified_persons", [])
 
-def classify_shot_type(metadata: dict, tech_meta: dict,
-                       audio_rms_dbfs: float, silence_ratio: float,
-                       usable: bool) -> str:
-    """Classify as talking / broll / mixed / unusable.
+    sync_spans = []
+    try:
+        for span in silent_spans:
+            span_start, span_end = span
+            span_dur = span_end - span_start
 
-    talking: known face on screen with speech for >50% of clip.
-    broll: no speech.
-    mixed: both.
-    unusable: quality check says so.
+            # Sample frames at 2fps within the span
+            n_samples = max(1, int(span_dur * 2))
+            n_samples = min(n_samples, 20)  # cap to avoid excessive ffmpeg calls
+            step = span_dur / n_samples
+            face_frames = 0
+
+            with tempfile.TemporaryDirectory() as tmp:
+                for j in range(n_samples):
+                    t = span_start + j * step + step / 2
+                    frame_path = Path(tmp) / f"sync_{j}.jpg"
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", str(t), "-i", str(file_path),
+                         "-frames:v", "1", "-q:v", "5", str(frame_path)],
+                        capture_output=True, timeout=30
+                    )
+                    if frame_path.exists():
+                        try:
+                            if engine.frame_has_face(str(frame_path)):
+                                face_frames += 1
+                        except Exception:
+                            pass
+
+            # If face (mouth motion proxy) in >50% of sampled frames, flag it
+            if n_samples > 0 and face_frames / n_samples > 0.5:
+                sync_spans.append(span)
+
+    except Exception as e:
+        log.warning(f"  Manual sync detection failed: {e}")
+
+    # Also flag if persons were identified but entire clip has no audio
+    if not sync_spans and persons and not has_audio and duration >= 3:
+        sync_spans = [[0.0, round(duration, 1)]]
+
+    return bool(sync_spans), sync_spans
+
+
+def compute_speech_ratio(transcript_words: list[dict], duration: float) -> float:
+    """Compute fraction of clip duration covered by speech.
+
+    speech_ratio = total span of transcript words / clip duration.
+    """
+    if duration <= 0 or not transcript_words:
+        return 0.0
+    total_speech = 0.0
+    for w in transcript_words:
+        start = w.get("start", 0)
+        end = w.get("end", 0)
+        total_speech += max(0, end - start)
+    return min(1.0, round(total_speech / duration, 3))
+
+
+def classify_content_type(metadata: dict, speech_ratio: float,
+                          usable: bool) -> str:
+    """Classify clip content for the Premiere timeline.
+
+    talking: known face on screen AND speech > 50% of duration.
+    broll: speech < 10% of duration, or no audio track.
+    mixed: anything between.
+    unusable: usable flag is false.
     """
     if not usable:
         return "unusable"
 
     persons = metadata.get("identified_persons", [])
     has_face = bool(persons)
-    has_speech = silence_ratio < 0.5 and audio_rms_dbfs > -50
-    transcription = metadata.get("transcription", "")
-    has_transcript = bool(transcription and len(transcription.strip()) > 10)
 
-    if has_face and (has_speech or has_transcript):
-        if silence_ratio > 0.3:
-            return "mixed"
+    if has_face and speech_ratio > 0.5:
         return "talking"
-    elif has_speech or has_transcript:
-        return "mixed"
-    else:
+    elif speech_ratio < 0.1:
         return "broll"
+    else:
+        return "mixed"
+
+
+def classify_shot_type(metadata: dict, tech_meta: dict) -> str:
+    """Classify framing: wide, medium, close-up, aerial, pov, interview, broll, mixed.
+
+    Based on the AI vision analysis output.
+    """
+    ai_shot = metadata.get("shot_type", "")
+    if ai_shot:
+        # Normalise the AI's answer to our enum
+        ai_lower = ai_shot.strip().lower().replace("-", "").replace("_", "")
+        mapping = {
+            "wide": "wide", "wideshot": "wide", "establishing": "wide",
+            "medium": "medium", "mediumshot": "medium", "mid": "medium",
+            "closeup": "close-up", "close": "close-up", "cu": "close-up",
+            "aerial": "aerial", "drone": "aerial", "bird": "aerial",
+            "pov": "pov", "pointofview": "pov",
+            "interview": "interview", "talking": "interview", "talkinghead": "interview",
+            "broll": "broll", "cutaway": "broll", "insert": "broll",
+        }
+        for key, val in mapping.items():
+            if key in ai_lower:
+                return val
+    return "mixed"
 
 
 def assess_usable(tech_meta: dict) -> bool:
@@ -481,13 +570,17 @@ _XMP_CLI_TEMPLATE = """\
       <metanas:clipId>{clip_id}</metanas:clipId>
       <metanas:fileHash>{file_hash}</metanas:fileHash>
       <metanas:camera>{camera}</metanas:camera>
+      <metanas:cameraRaw>{camera_raw}</metanas:cameraRaw>
       <metanas:day>{day}</metanas:day>
       <metanas:shotType>{shot_type}</metanas:shotType>
+      <metanas:contentType>{content_type}</metanas:contentType>
+      <metanas:speechRatio>{speech_ratio}</metanas:speechRatio>
       <metanas:needsManualSync>{needs_manual_sync}</metanas:needsManualSync>
       <metanas:syncSpans>{sync_spans_json}</metanas:syncSpans>
       <metanas:audioRmsDbfs>{audio_rms_dbfs}</metanas:audioRmsDbfs>
       <metanas:silenceRatio>{silence_ratio}</metanas:silenceRatio>
       <metanas:usable>{usable}</metanas:usable>
+      <metanas:thumbs>{thumbs_json}</metanas:thumbs>
       <metanas:transcript>{transcript_json}</metanas:transcript>
       <metanas:metanasVersion>{metanas_version}</metanas:metanasVersion>
       <metanas:processedAt>{processed_at}</metanas:processedAt>
@@ -519,6 +612,9 @@ def write_cli_sidecar(media_path: Path, metadata: dict, cli_fields: dict,
     transcript_words = cli_fields.get("transcript_words", [])
     transcript_json = json.dumps(transcript_words, separators=(",", ":"))
 
+    # Thumbs: store as JSON array of relative paths
+    thumbs_json = json.dumps(cli_fields.get("scene_thumbs", []), separators=(",", ":"))
+
     xmp_content = _XMP_CLI_TEMPLATE.format(
         description=xs(description),
         subject_items=subject_items,
@@ -528,13 +624,17 @@ def write_cli_sidecar(media_path: Path, metadata: dict, cli_fields: dict,
         clip_id=xs(cli_fields.get("clip_id", "")),
         file_hash=xs(cli_fields.get("file_hash", "")),
         camera=xs(cli_fields.get("camera", "")),
+        camera_raw=xs(cli_fields.get("camera_raw", "")),
         day=cli_fields.get("day", 0),
         shot_type=xs(cli_fields.get("shot_type", "")),
+        content_type=xs(cli_fields.get("content_type", "")),
+        speech_ratio=cli_fields.get("speech_ratio", 0),
         needs_manual_sync=str(cli_fields.get("needs_manual_sync", False)).lower(),
         sync_spans_json=xs(json.dumps(cli_fields.get("sync_spans", []), separators=(",", ":"))),
         audio_rms_dbfs=cli_fields.get("audio_rms_dbfs", 0),
         silence_ratio=cli_fields.get("silence_ratio", 0),
         usable=str(cli_fields.get("usable", True)).lower(),
+        thumbs_json=xs(thumbs_json),
         transcript_json=xs(transcript_json),
         metanas_version=xs(APP_VERSION),
         processed_at=xs(datetime.now(timezone.utc).isoformat()),
@@ -635,9 +735,16 @@ def parse_sidecar(xmp_path: Path) -> dict | None:
 
     file_hash = _unescape_xml(_extract("fileHash"))
     camera = _unescape_xml(_extract("camera"))
+    camera_raw = _unescape_xml(_extract("cameraRaw")) or camera
     day_str = _extract("day")
     day = int(day_str) if day_str.isdigit() else 0
     shot_type = _unescape_xml(_extract("shotType"))
+    content_type = _unescape_xml(_extract("contentType"))
+    speech_ratio_raw = _extract("speechRatio")
+    try:
+        speech_ratio = float(speech_ratio_raw) if speech_ratio_raw else 0
+    except ValueError:
+        speech_ratio = 0
     needs_sync = _extract("needsManualSync").lower() == "true"
     sync_spans_raw = _unescape_xml(_extract("syncSpans"))
     try:
@@ -661,6 +768,12 @@ def parse_sidecar(xmp_path: Path) -> dict | None:
         transcript_words = json.loads(transcript_raw) if transcript_raw else []
     except json.JSONDecodeError:
         transcript_words = []
+
+    thumbs_raw = _unescape_xml(_extract("thumbs"))
+    try:
+        thumbs = json.loads(thumbs_raw) if thumbs_raw else []
+    except json.JSONDecodeError:
+        thumbs = []
 
     version = _unescape_xml(_extract("metanasVersion"))
     processed_at = _unescape_xml(_extract("processedAt"))
@@ -693,13 +806,17 @@ def parse_sidecar(xmp_path: Path) -> dict | None:
         "path": str(media_file) if media_file else str(xmp_path.with_suffix("")),
         "file_hash": file_hash,
         "camera": camera,
+        "camera_raw": camera_raw,
         "day": day,
         "shot_type": shot_type,
+        "content_type": content_type,
+        "speech_ratio": speech_ratio,
         "needs_manual_sync": needs_sync,
         "sync_spans": sync_spans,
         "audio_rms_dbfs": audio_rms,
         "silence_ratio": silence_ratio,
         "usable": usable,
+        "thumbs": thumbs,
         "description": description,
         "tags": tags,
         "camera_model": camera_model,
@@ -771,9 +888,11 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
     has_audio = tech.get("has_audio", False)
 
     # 2. Camera and day (new)
-    folder_camera, day = parse_camera_day(file_path)
+    folder_camera, camera_raw, day = parse_camera_day(file_path, config)
     meta_camera = engine.infer_camera_type(tech, file_path)
     camera = folder_camera or meta_camera or "Unknown"
+    if not camera_raw:
+        camera_raw = camera  # fallback: SOP name is also raw
     camera_warning = None
     if folder_camera and meta_camera and folder_camera.lower() != meta_camera.lower():
         camera_warning = f"Folder says {folder_camera}, metadata says {meta_camera}"
@@ -781,15 +900,14 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
 
     clip_id = make_clip_id(camera, day, file_path)
 
-    # Hash for resume
-    file_hash = file_hash_xxh64(file_path)
-
-    # Check resume: if sidecar exists and hash matches, skip
+    # Check resume: hash the file and compare to stored hash in sidecar.
+    # The stored hash is post-embed, so an unchanged file matches.
+    file_hash_now = file_hash_xxh64(file_path)
     xmp_path = file_path.with_suffix(".xmp")
     if not reprocess and xmp_path.exists():
         try:
             existing = parse_sidecar(xmp_path)
-            if existing and existing.get("file_hash") == file_hash:
+            if existing and existing.get("file_hash") == file_hash_now:
                 return {"clip_id": clip_id, "status": "skipped", "shot_type": "",
                         "duration": duration, "camera": camera, "day": day,
                         "file_path": file_path}
@@ -866,26 +984,36 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
         metadata["camera_model"] = camera
         metadata["custom_tags"] = []
 
-    # 7. Shot type and audio check (new)
+    # 7. Audio analysis
     audio_rms, silence_ratio = float("-inf"), 1.0
-    needs_sync, sync_spans = False, []
     if has_audio:
         audio_rms, silence_ratio = compute_audio_rms(file_path)
-        needs_sync, sync_spans = detect_lip_sync_issues(
-            file_path, tech, audio_rms
-        )
 
-    # 8. Quality / usable
+    # 8. Quality / usable / shot type / content type
     usable = assess_usable(tech)
-    shot_type = classify_shot_type(metadata, tech, audio_rms, silence_ratio, usable)
+    shot_type = classify_shot_type(metadata, tech)
+    speech_ratio = compute_speech_ratio(transcript_words, duration)
+    content_type = classify_content_type(metadata, speech_ratio, usable)
 
-    # 9. Write sidecar (atomic, then move on)
+    # Sync detection: visible speech with no audio (Fix 3)
+    needs_sync, sync_spans = detect_needs_manual_sync(
+        file_path, tech, audio_rms, has_audio, metadata
+    )
+
+    # 9. Write sidecar → embed → hash → update sidecar with post-embed hash
+    #    The hash must be computed AFTER the embed so --resume compares
+    #    the stored hash against the (already-embedded) file on disk.
+    embed_enabled = config.get("embed_metadata", True) and not config.get("no_embed", False)
+
     cli_fields = {
         "clip_id": clip_id,
-        "file_hash": file_hash,
+        "file_hash": "",  # placeholder — filled after embed
         "camera": camera,
+        "camera_raw": camera_raw,
         "day": day,
         "shot_type": shot_type,
+        "content_type": content_type,
+        "speech_ratio": speech_ratio,
         "needs_manual_sync": needs_sync,
         "sync_spans": sync_spans,
         "audio_rms_dbfs": audio_rms if math.isfinite(audio_rms) else -999,
@@ -897,12 +1025,19 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
 
     write_cli_sidecar(file_path, metadata, cli_fields, overwrite=reprocess)
 
-    # Also run the engine's embed (for Premiere compatibility)
-    if config.get("embed_metadata", True):
+    # Embed metadata into the MP4 (changes file bytes)
+    if embed_enabled:
         try:
             engine.embed_metadata_in_video(file_path, metadata)
         except Exception as e:
             log.warning(f"  Embed failed (non-fatal): {e}")
+
+    # Hash AFTER embed so the stored hash matches the file as it now stands
+    file_hash = file_hash_xxh64(file_path)
+    cli_fields["file_hash"] = file_hash
+
+    # Rewrite sidecar with the real hash (the embed doesn't touch .xmp)
+    write_cli_sidecar(file_path, metadata, cli_fields, overwrite=True)
 
     # Also upsert to DB (keeps the GUI's database in sync)
     try:
@@ -946,6 +1081,7 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
         "clip_id": clip_id,
         "status": "ok" if not sync_note else sync_note,
         "shot_type": shot_type,
+        "content_type": content_type,
         "duration": duration,
         "duration_str": dur_str,
         "camera": camera,
@@ -984,6 +1120,8 @@ def cmd_ingest(args):
 
     # Load config
     config = load_config()
+    if args.no_embed:
+        config["no_embed"] = True
     workers = args.workers or config.get("max_workers", os.cpu_count() or 4)
     # GPU transcription stays serial
     if config.get("vision_provider", "gemini").lower() == "ollama" and workers > 1:
@@ -1003,7 +1141,7 @@ def cmd_ingest(args):
     if args.dry_run:
         print(f"Dry run: {total} clip(s) found\n")
         for i, v in enumerate(videos, 1):
-            cam, day = parse_camera_day(v)
+            cam, _raw, day = parse_camera_day(v, config)
             cam_str = cam or "?"
             print(f"  [{i}/{total}] {cam_str}_day{day}/{v.name}")
         print(f"\nTotal: {total} clips")
@@ -1064,19 +1202,20 @@ def cmd_ingest(args):
 
                 processed += 1
                 shot = result.get("shot_type", "")
+                ctype = result.get("content_type", "")
                 dur_str = result.get("duration_str", "??:??")
                 status = result.get("status", "ok")
                 dur = result.get("duration", 0)
 
-                if shot == "talking":
+                if ctype == "talking":
                     talking_seconds += dur
-                elif shot == "broll":
+                elif ctype == "broll":
                     broll_seconds += dur
                 if result.get("needs_sync"):
                     sync_flagged += 1
 
                 if not args.quiet:
-                    print(f"[{i}/{total}] {rel_path}  {shot}  {dur_str}  {status}",
+                    print(f"[{i}/{total}] {rel_path}  {shot}/{ctype}  {dur_str}  {status}",
                           flush=True)
 
             except Exception as e:
@@ -1179,6 +1318,9 @@ def main():
                           help="Suppress per-clip progress lines")
     p_ingest.add_argument("--dry-run", action="store_true",
                           help="List what would be processed and exit")
+    p_ingest.add_argument("--no-embed", action="store_true",
+                          help="Skip embedding metadata into the video file "
+                               "(keeps source bytes identical)")
 
     # ── index ─────────────────────────────────────────────────────────────
     p_index = subparsers.add_parser("index",

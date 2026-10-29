@@ -37,6 +37,7 @@ metanas ingest <footage_folder> [options]
 | `<footage_folder>` | required | The `_Footage` folder, or any subfolder |
 | `--out <path>` | `<project>_Premiere/brief` | Where clips.json, thumbs/, failures.json go |
 | `--resume` | off | Skip clips whose sidecar exists and hash matches |
+| `--no-embed` | off | Skip embedding metadata into the video file (keeps source bytes identical) |
 | `--cameras A7S3,ZVE1` | all | Only process these camera folders |
 | `--workers N` | CPU count | Parallel workers (Ollama forces 1) |
 | `--quiet` | off | Suppress per-clip progress |
@@ -74,13 +75,13 @@ metanas index "/Volumes/Assort2025/.../040524a_Hiriketiya_Footage"
 
 ## Progress line format
 
-One line per clip, flushed immediately:
+One line per clip, flushed immediately (format: `shotType/contentType`):
 
 ```
-[12/340] A7S3_day1/C0042.MP4  talking  02:14  ok
-[13/340] Drone_day1/DJI_0007.MP4  broll  00:48  ok
-[14/340] ZVE1_day2/C0101.MP4  talking  01:03  SYNC NEEDED 12-41
-[15/340] I360_day1/VID_0003.insv  -  -  FAILED unsupported codec
+[12/340] A7S3_day1/C0042.MP4  interview/talking  02:14  ok
+[13/340] Drone_day1/DJI_0007.MP4  aerial/broll  00:48  ok
+[14/340] ZVE1_day2/C0101.MP4  close-up/talking  01:03  SYNC NEEDED 12-41
+[15/340] I360_day1/VID_0003.insv  -/-  -  FAILED unsupported codec
 ```
 
 Followed by a summary: clips processed, skipped, failed, sync-flagged, talking/broll minutes, and wall time.
@@ -110,6 +111,23 @@ Only one ingest can run per output folder at a time. The lock file contains the 
 ## Configuration
 
 Reads `~/.metanas/config.yaml` — the same file the GUI uses. No separate CLI config needed. Vision provider, API keys, whisper model, reference persons, and all other settings are shared.
+
+### Camera aliases
+
+Add a `camera_aliases` map to resolve older folder names to SOP names:
+
+```yaml
+camera_aliases:
+  Sony: A7S3
+  Action: ACT5
+  Insta360: I360
+```
+
+The SOP name is written to `metanas:camera`; the raw folder token to `metanas:cameraRaw`.
+
+### Speaker labels
+
+`faster_whisper` (the current transcription engine) does not provide speaker diarisation. For per-speaker labels, create a separate Python 3.12 venv with WhisperX — the CLI detects and uses it automatically when available.
 
 ## Sidecar fields
 
