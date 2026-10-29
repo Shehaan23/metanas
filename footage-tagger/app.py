@@ -723,6 +723,28 @@ def start_tag():
     if not Path(folder).exists():
         return jsonify({"error": f"Folder not found: {folder}"}), 400
 
+    # ── CLI lock check — refuse if a CLI ingest is running on this folder ─────
+    # Scan for .metanas.lock in likely output dirs (the folder itself, sibling
+    # _Premiere/brief, and the folder's parent _Premiere/brief).
+    _lock_candidates = [
+        Path(folder) / ".metanas.lock",
+    ]
+    _proj_root = Path(folder).parent
+    _lock_candidates.append(_proj_root / f"{_proj_root.name}_Premiere" / "brief" / ".metanas.lock")
+    for _lp in _lock_candidates:
+        if _lp.exists():
+            try:
+                import json as _json
+                _lock_data = _json.loads(_lp.read_text())
+                _pid = _lock_data.get("pid", 0)
+                os.kill(_pid, 0)  # check if alive
+                return jsonify({
+                    "error": f"A CLI ingest is already running on this folder (PID {_pid}). "
+                             f"Wait for it to finish or remove {_lp}"
+                }), 409
+            except (OSError, ValueError, KeyError):
+                pass  # PID dead or corrupt lock — ignore
+
     job_id = str(uuid.uuid4())[:8]
     q      = queue.Queue()
     jobs[job_id] = {

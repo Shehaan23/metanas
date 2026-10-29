@@ -1,0 +1,25 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  metanas — CLI entry point
+#  Install: sudo ln -sf "$(cd "$(dirname "$0")" && pwd)/metanas" /usr/local/bin/metanas
+# ─────────────────────────────────────────────────────────────────────────────
+
+METANAS_HOME="$HOME/.metanas"
+VENV="$METANAS_HOME/.venv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Prefer shadow-updated cli.py if present
+if [ -f "$METANAS_HOME/updates/cli.py" ]; then
+    CLI_SCRIPT="$METANAS_HOME/updates/cli.py"
+else
+    CLI_SCRIPT="$SCRIPT_DIR/cli.py"
+fi
+
+# Use venv Python if available
+if [ -f "$VENV/bin/python3" ]; then
+    PYTHON="$VENV/bin/python3"
+else
+    PYTHON="python3"
+fi
+
+exec "$PYTHON" "$CLI_SCRIPT" "$@"
