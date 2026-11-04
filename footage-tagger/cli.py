@@ -900,17 +900,19 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
 
     clip_id = make_clip_id(camera, day, file_path)
 
-    # Check resume: hash the file and compare to stored hash in sidecar.
-    # The stored hash is post-embed, so an unchanged file matches.
-    file_hash_now = file_hash_xxh64(file_path)
+    # Check resume: compare stored hash in sidecar against current file.
+    # Only hash the file if a sidecar exists — new clips have no sidecar,
+    # so hashing 300 MB over SMB for nothing just stresses the NAS.
     xmp_path = file_path.with_suffix(".xmp")
     if not reprocess and xmp_path.exists():
         try:
             existing = parse_sidecar(xmp_path)
-            if existing and existing.get("file_hash") == file_hash_now:
-                return {"clip_id": clip_id, "status": "skipped", "shot_type": "",
-                        "duration": duration, "camera": camera, "day": day,
-                        "file_path": file_path}
+            if existing and existing.get("file_hash"):
+                file_hash_now = file_hash_xxh64(file_path)
+                if existing["file_hash"] == file_hash_now:
+                    return {"clip_id": clip_id, "status": "skipped", "shot_type": "",
+                            "duration": duration, "camera": camera, "day": day,
+                            "file_path": file_path}
         except Exception:
             pass
 
@@ -947,10 +949,14 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
             )
 
         # 6. Face matching and tags (existing engine)
+        #    Early-exit: once a reference person is identified in a keyframe,
+        #    remove them from the list for subsequent keyframes (saves ~5s/person).
         metadata = {"transcription": transcription}
+        remaining_persons = list(reference_persons) if reference_persons else []
+        found_person_names = set()
         for kf in keyframes:
             ai_meta, provider = engine.analyse_frame_with_failover(
-                kf, config, reference_persons
+                kf, config, remaining_persons
             )
             # Merge AI metadata (last frame wins for single-value fields)
             for key in ("description", "shot_type", "subjects", "setting",
@@ -967,6 +973,15 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
                             metadata[key] = val
                     else:
                         metadata[key] = val
+            # Early-exit: remove already-found persons from remaining list
+            newly_found = ai_meta.get("identified_persons", [])
+            if newly_found and remaining_persons:
+                for name in newly_found:
+                    found_person_names.add(str(name).strip().lower())
+                remaining_persons = [
+                    p for p in remaining_persons
+                    if p.get("name", "").strip().lower() not in found_person_names
+                ]
 
         # Deduplicate list fields
         for key in ("subjects", "tags", "mood_tags", "identified_persons"):
@@ -1031,6 +1046,17 @@ def process_clip(file_path: Path, config: dict, reference_persons: list,
             engine.embed_metadata_in_video(file_path, metadata)
         except Exception as e:
             log.warning(f"  Embed failed (non-fatal): {e}")
+
+    # NAS I/O cooldown: after the embed writes ~300 MB, give the SMB stack
+    # time to flush before reading the file again for the hash.  Also do a
+    # lightweight stat() call as a keepalive so the NAS doesn't drop the
+    # connection during the pause.
+    if embed_enabled:
+        time.sleep(1.5)
+        try:
+            os.stat(file_path)          # SMB keepalive
+        except OSError:
+            pass
 
     # Hash AFTER embed so the stored hash matches the file as it now stands
     file_hash = file_hash_xxh64(file_path)
