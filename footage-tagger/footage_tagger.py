@@ -1131,6 +1131,57 @@ def write_xmp_sidecar(media_path, metadata, overwrite=False):
 # This is required for Adobe Bridge to display metadata for video files.
 # exiftool only writes to the metadata container — the video stream is untouched.
 
+def _exiftool_timeout_for_file(media_path):
+    """Dynamic timeout: 60s base + 1s per MB of file size. Min 60s, max 1800s (30 min)."""
+    try:
+        size_mb = Path(media_path).stat().st_size / (1024 * 1024)
+        timeout = int(60 + size_mb)
+        return max(60, min(timeout, 1800))
+    except OSError:
+        return 300  # fallback if stat fails
+
+
+def _run_exiftool_with_retry(cmd, media_path, max_retries=2):
+    """Run exiftool with dynamic timeout and retry on failure.
+    Returns True on success, False if all attempts fail."""
+    timeout = _exiftool_timeout_for_file(media_path)
+    file_name = Path(media_path).name
+
+    for attempt in range(1 + max_retries):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0:
+                log.info(f"  ✓ Metadata embedded into: {file_name}")
+                return True
+            else:
+                err_msg = result.stderr.strip()[:200]
+                if attempt < max_retries:
+                    wait = 5 * (2 ** attempt)  # 5s, 10s
+                    log.warning(f"  exiftool embed failed for {file_name} (attempt {attempt+1}/{1+max_retries}): {err_msg} — retrying in {wait}s")
+                    time.sleep(wait)
+                else:
+                    log.warning(f"  exiftool embed failed for {file_name} after {1+max_retries} attempts: {err_msg}")
+                    return False
+        except subprocess.TimeoutExpired:
+            if attempt < max_retries:
+                wait = 10 * (2 ** attempt)  # 10s, 20s
+                log.warning(f"  exiftool embed timed out for {file_name} ({timeout}s, attempt {attempt+1}/{1+max_retries}) — retrying in {wait}s")
+                time.sleep(wait)
+                timeout = int(timeout * 1.5)  # increase timeout on retry
+            else:
+                log.warning(f"  exiftool embed timed out for {file_name} after {1+max_retries} attempts ({timeout}s) — XMP sidecar is still valid")
+                return False
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 5 * (2 ** attempt)
+                log.warning(f"  exiftool embed error for {file_name} (attempt {attempt+1}/{1+max_retries}): {e} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                log.warning(f"  Could not embed metadata into {file_name} after {1+max_retries} attempts: {e}")
+                return False
+    return False
+
+
 def embed_metadata_in_video(media_path, metadata):
     description, unique_tags, _ = build_xmp_fields(metadata)
     persons = metadata.get("identified_persons", [])
@@ -1171,16 +1222,7 @@ def embed_metadata_in_video(media_path, metadata):
 
     cmd.append(str(media_path))
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            log.info(f"  ✓ Metadata embedded into: {media_path.name}")
-        else:
-            log.warning(f"  exiftool embed warning: {result.stderr.strip()[:200]}")
-    except subprocess.TimeoutExpired:
-        log.warning(f"  exiftool embed timed out for {media_path.name} (300s) — XMP sidecar is still valid")
-    except Exception as e:
-        log.warning(f"  Could not embed metadata into {media_path.name}: {e}")
+    _run_exiftool_with_retry(cmd, media_path)
 
 
 # ── Embed metadata into image via exiftool ────────────────────────────────────
@@ -1206,14 +1248,7 @@ def embed_metadata_in_image(media_path, metadata):
 
     cmd.append(str(media_path))
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            log.info(f"  ✓ Metadata embedded into: {media_path.name}")
-        else:
-            log.warning(f"  exiftool embed warning: {result.stderr.strip()[:200]}")
-    except Exception as e:
-        log.warning(f"  Could not embed metadata into {media_path.name}: {e}")
+    _run_exiftool_with_retry(cmd, media_path)
 
 
 # ── SQLite database ───────────────────────────────────────────────────────────
