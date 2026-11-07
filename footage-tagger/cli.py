@@ -1245,6 +1245,19 @@ def cmd_ingest(args):
                           flush=True)
 
             except Exception as e:
+                err_lower = str(e).lower()
+                # ── NAS disconnect detection ─────────────────────────────
+                if any(k in err_lower for k in (
+                    "disk i/o error", "unable to open database",
+                    "input/output error", "stale file handle",
+                )):
+                    print(f"\n✗ NAS DISCONNECTED at clip {i}/{total} — stopping.",
+                          flush=True)
+                    print("  Re-run once the NAS is back — already-processed "
+                          "clips will be skipped.", flush=True)
+                    release_lock(lock_path)
+                    sys.exit(75)  # EX_TEMPFAIL — wrapper can auto-retry
+
                 failed_count += 1
                 failures.append({
                     "path": str(video),

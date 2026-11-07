@@ -1795,6 +1795,24 @@ def main():
     import threading
     failed_files = []  # Feature 3: track failed files for retry
 
+    # ── NAS disconnect detection ─────────────────────────────────────────
+    # When the NAS drops, every subsequent file fails with "disk I/O error".
+    # Instead of spamming hundreds of identical errors, detect the first one
+    # and stop processing.  Exit code 75 (EX_TEMPFAIL) signals the wrapper
+    # script to wait for the NAS and re-run.
+    _nas_disconnected = threading.Event()
+    _NAS_EXIT_CODE = 75  # sysexits.h EX_TEMPFAIL — "try again later"
+
+    def _is_nas_error(exc):
+        """Return True if the exception looks like a NAS/disk disconnect."""
+        msg = str(exc).lower()
+        return any(k in msg for k in (
+            "disk i/o error", "unable to open database",
+            "database is locked", "attempt to write a readonly database",
+            "input/output error", "stale file handle",
+            "no such file or directory" if "db" in msg else "",
+        ))
+
     # Thread-local storage: each worker gets ONE persistent DB connection
     # instead of opening/closing per file (avoids hundreds of connect calls).
     _thread_local = threading.local()
@@ -1817,10 +1835,18 @@ def main():
 
     def process_file_wrapper(file_type, file_index, total_index, file_path):
         """Wrapper to process a single file and track progress."""
+        # ── Early exit if NAS already down ───────────────────────────────
+        if _nas_disconnected.is_set():
+            return (0, None)  # silently skip — already logged the first error
+
         try:
             thread_conn = _get_thread_conn()
         except sqlite3.OperationalError as e:
-            log.error(f"  ERROR: {e}")
+            if _is_nas_error(e):
+                _nas_disconnected.set()
+                log.error(f"\n✗ NAS DISCONNECTED — stopping. ({e})")
+            else:
+                log.error(f"  ERROR: {e}")
             return (0, (file_type, file_index, total_index, file_path))
         skip, _ = already_processed(thread_conn, file_path)
         log.info(f"\n[{file_type} {file_index}/{total_index}] {file_path.parent.name} / {file_path.name}")
@@ -1833,6 +1859,10 @@ def main():
                 return (1, None)
             return (0, None)
         except Exception as e:
+            if _is_nas_error(e):
+                _nas_disconnected.set()
+                log.error(f"\n✗ NAS DISCONNECTED — stopping. ({e})")
+                return (0, None)
             log.error(f"  ERROR: {e}")
             # If it's a DB error, reset the thread connection so it reconnects
             if "database" in str(e).lower() or "unable to open" in str(e).lower():
@@ -1860,10 +1890,30 @@ def main():
                 if failed:
                     failed_files.append(failed)
             except Exception as e:
-                log.error(f"Worker exception: {e}")
+                if _is_nas_error(e):
+                    _nas_disconnected.set()
+                    log.error(f"\n✗ NAS DISCONNECTED — stopping. ({e})")
+                else:
+                    log.error(f"Worker exception: {e}")
+            # If NAS dropped, cancel all pending futures
+            if _nas_disconnected.is_set():
+                for f in futures:
+                    f.cancel()
+                break
 
     # Close thread-local connections
     # (ThreadPoolExecutor reuses threads, so clean up after the pool exits)
+
+    # ── NAS disconnected?  Skip retries and exit with EX_TEMPFAIL ──────
+    if _nas_disconnected.is_set():
+        elapsed = (time.time() - start) / 60
+        log.info(f"\n✗ NAS disconnected after {processed} file(s) in {elapsed:.0f} min.")
+        log.info("  Re-run this command once the NAS is back — already-processed files will be skipped.")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        sys.exit(_NAS_EXIT_CODE)
 
     # Feature 3: Retry failed files (sequentially, with a fresh connection)
     if failed_files:
